@@ -6,7 +6,7 @@ from PySide6.QtGui import QKeySequence
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QComboBox, QFrame,
-    QDialogButtonBox, QGroupBox,
+    QDialogButtonBox, QGroupBox, QMessageBox,
 )
 
 from app.hotkeys import ACTIONS
@@ -201,6 +201,28 @@ class HotkeyDialog(QDialog):
                 btn.set_combo("" if combo == "none" else combo)
         for cb in self._col_profile_combos:
             cb.setCurrentIndex(0)
+
+    def accept(self):
+        """OK前に重複キーがないか検証する。"""
+        seen: set[str] = set()
+        dups: set[str] = set()
+        for btns in self._action_btns.values():
+            for btn in btns:
+                combo = btn.combo()
+                if combo:
+                    if combo in seen:
+                        dups.add(combo)
+                    else:
+                        seen.add(combo)
+        if dups:
+            QMessageBox.warning(
+                self, "重複するキーがあります",
+                "以下のキーが複数のアクションに割り当てられています:\n"
+                + "\n".join(f"  {d}" for d in sorted(dups))
+                + "\n\n重複を解消してから保存してください。",
+            )
+            return
+        super().accept()
 
     def get_slots(self) -> list:
         """設定されたスロットリストを返す。"""

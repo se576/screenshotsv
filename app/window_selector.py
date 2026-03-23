@@ -7,9 +7,11 @@ import ctypes
 import ctypes.wintypes
 from dataclasses import dataclass
 
-from PySide6.QtCore import Qt, QRect, QPoint, QTimer
+from PySide6.QtCore import Qt, QRect, QPoint
 from PySide6.QtGui import QPixmap, QPainter, QColor, QPen, QFont, QCursor
 from PySide6.QtWidgets import QApplication, QWidget
+
+from app.capture import _virtual_geometry
 
 _user32 = ctypes.windll.user32
 _WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
@@ -69,15 +71,14 @@ def _find_window_at(windows: list[WindowInfo], pos: QPoint) -> WindowInfo | None
 
 
 class WindowSelector(QWidget):
-    def __init__(self, background: QPixmap, windows: list[WindowInfo], callback):
+    def __init__(self, background: QPixmap, windows: list[WindowInfo], callback,
+                 cancel_callback=None):
         super().__init__()
         self._bg = background
         self._windows = windows
         self._callback = callback
+        self._cancel_callback = cancel_callback
         self._current: WindowInfo | None = None
-
-        screen = QApplication.primaryScreen().geometry()
-        self.setGeometry(screen)
 
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
@@ -87,15 +88,11 @@ class WindowSelector(QWidget):
         self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self.setMouseTracking(True)
 
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self._poll_cursor)
-        self._timer.start(30)
-
-    def _poll_cursor(self):
-        pt = ctypes.wintypes.POINT()
-        ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
-        cursor = QPoint(pt.x, pt.y)
-        win = _find_window_at(self._windows, cursor)
+    def showEvent(self, event):
+        super().showEvent(event)
+        # 初期カーソル位置でウィンドウを特定
+        cursor_pos = QCursor.pos()
+        win = _find_window_at(self._windows, cursor_pos)
         if win is not self._current:
             self._current = win
             self.update()
@@ -106,7 +103,9 @@ class WindowSelector(QWidget):
         painter.fillRect(self.rect(), QColor(0, 0, 0, 110))
 
         if self._current:
-            r = self._current.rect
+            # 仮想デスクトップ内でのウィンドウ矩形をウィジェット座標に変換
+            vg = _virtual_geometry()
+            r = self._current.rect.translated(-vg.x(), -vg.y())
 
             # 選択ウィンドウ領域を明るく再描画
             painter.drawPixmap(r, self._bg, r)
@@ -143,27 +142,39 @@ class WindowSelector(QWidget):
         painter.drawText(10, self.height() - 8,
                          "クリック: キャプチャ  /  Esc: キャンセル")
 
+    def mouseMoveEvent(self, event):
+        # グローバル座標でウィンドウを検索（スクリーン座標と一致）
+        global_pos = event.globalPosition().toPoint()
+        win = _find_window_at(self._windows, global_pos)
+        if win is not self._current:
+            self._current = win
+            self.update()
+
     def mousePressEvent(self, event):
         if event.button() != Qt.MouseButton.LeftButton:
             return
-        self._timer.stop()
         target = self._current
         self.close()
         if target:
-            pixmap = self._bg.copy(target.rect)
+            vg = _virtual_geometry()
+            # ウィジェット座標で bg をコピー
+            local_rect = target.rect.translated(-vg.x(), -vg.y())
+            pixmap = self._bg.copy(local_rect)
             self._callback(pixmap)
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape:
-            self._timer.stop()
             self.close()
+            if self._cancel_callback:
+                self._cancel_callback()
 
 
-def start_window_capture(callback):
+def start_window_capture(callback, cancel_callback=None):
     """ウィンドウ選択オーバーレイを起動する。選択後 callback に QPixmap を渡す。"""
-    # オーバーレイを出す前にウィンドウ一覧とスクリーンショットを取得
     windows = _enum_visible_windows()
-    bg = QApplication.primaryScreen().grabWindow(0)
-    selector = WindowSelector(bg, windows, callback)
-    selector.showFullScreen()
+    vg = _virtual_geometry()
+    bg = QApplication.primaryScreen().grabWindow(0, vg.x(), vg.y(), vg.width(), vg.height())
+    selector = WindowSelector(bg, windows, callback, cancel_callback)
+    selector.setGeometry(vg)
+    selector.show()
     return selector

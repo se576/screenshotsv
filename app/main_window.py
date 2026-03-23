@@ -3,7 +3,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QPixmap, QKeySequence, QShortcut, QColor, QIcon, QPixmap as QPixmapIcon
+from PySide6.QtGui import QPixmap, QKeySequence, QShortcut, QColor
 from PySide6.QtWidgets import (
     QMainWindow,
     QWidget,
@@ -14,12 +14,12 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QMessageBox,
     QStatusBar,
-    QSizePolicy,
     QApplication,
     QSpinBox,
     QColorDialog,
     QFrame,
     QComboBox,
+    QMenu,
 )
 
 from app import capture, settings
@@ -29,24 +29,42 @@ from app.profile_dialog import ProfileDialog
 from app.hotkey_dialog import HotkeyDialog
 from app.hotkeys import HotkeyManager
 from app.editor import EditorCanvas
+from app.ui_utils import color_icon
 
 
-def _color_icon(color: QColor, size: int = 16) -> QIcon:
-    """指定色の正方形アイコンを生成する。"""
-    pm = QPixmapIcon(size, size)
-    pm.fill(color)
-    return QIcon(pm)
+def _apply_border_effect(pixmap: QPixmap, prof: dict) -> QPixmap:
+    """プロファイル設定に基づいて外枠エフェクトを適用する。無効なら元画像を返す。"""
+    if not prof.get("auto_border_enabled", False):
+        return pixmap
+    from PySide6.QtGui import QPainter, QPen
+    from PySide6.QtCore import Qt
+    result = pixmap.copy()
+    painter = QPainter(result)
+    w = prof.get("auto_border_width", 4)
+    color = QColor(prof.get("auto_border_color", "#ff0000"))
+    pen = QPen(color, w)
+    pen.setJoinStyle(Qt.PenJoinStyle.MiterJoin)
+    painter.setPen(pen)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    offset = w // 2
+    painter.drawRect(offset, offset, result.width() - w, result.height() - w)
+    painter.end()
+    return result
 
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self._root = settings.load()          # {"active_profile":…, "profiles":{…}}
-        self._selector = None
         self._current_color = QColor(255, 0, 0)
         self._backup_path: Path | None = None
         self._active_tool: str | None = None
         self._hotkey_manager = HotkeyManager(self)
+        self._selector = None
+        self._countdown_timer: QTimer | None = None
+        self._countdown_remaining: int = 0
+        self._countdown_action = None
+        self._pending_capture_profile: dict | None = None
         self._setup_ui()
         self._setup_shortcuts()
         self._start_hotkeys()
@@ -66,34 +84,50 @@ class MainWindow(QMainWindow):
         cb_layout.setContentsMargins(8, 6, 8, 6)
         cb_layout.setSpacing(6)
 
+        # キャプチャ操作
         self._btn_full = QPushButton("全画面 [F1]")
+        self._btn_full.setToolTip("全画面キャプチャ (F1)")
         self._btn_region = QPushButton("範囲選択 [F2]")
+        self._btn_region.setToolTip("範囲選択キャプチャ (F2) — Esc でキャンセル")
         self._btn_window = QPushButton("ウィンドウ [F3]")
-        self._btn_copy = QPushButton("コピー [Ctrl+C]")
-        self._btn_quicksave = QPushButton("即時保存 [Ctrl+Shift+S]")
-        self._btn_save = QPushButton("保存... [Ctrl+S]")
-        self._btn_folder = QPushButton("保存先...")
-        self._btn_save_options = QPushButton("保存設定...")
-        self._btn_hotkey_settings = QPushButton("ホットキー設定...")
-        # プロファイル
-        lbl_profile = QLabel("プロファイル:")
-        self._combo_profile = QComboBox()
-        self._combo_profile.setMinimumWidth(110)
-        self._btn_profile_mgr = QPushButton("管理...")
-        self._lbl_folder = QLabel()
-        self._lbl_folder.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        self._update_folder_label()
-
-        for btn in (self._btn_copy, self._btn_quicksave, self._btn_save):
-            btn.setEnabled(False)
-
-        # 遅延設定
+        self._btn_window.setToolTip("ウィンドウキャプチャ (F3) — Esc でキャンセル")
         lbl_delay = QLabel("遅延:")
         self._spin_delay = QSpinBox()
         self._spin_delay.setRange(0, 30)
         self._spin_delay.setValue(0)
         self._spin_delay.setSuffix(" 秒")
         self._spin_delay.setFixedWidth(72)
+        self._spin_delay.setToolTip("キャプチャ前の待機時間（秒）")
+
+        # キャプチャ後操作
+        self._btn_copy = QPushButton("コピー [Ctrl+C]")
+        self._btn_copy.setToolTip("クリップボードにコピー (Ctrl+C)")
+        self._btn_quicksave = QPushButton("即時保存 [Ctrl+Shift+S]")
+        self._btn_quicksave.setToolTip("プロファイルの保存先へ即時保存 (Ctrl+Shift+S)")
+        self._btn_save = QPushButton("保存... [Ctrl+S]")
+        self._btn_save.setToolTip("名前を付けて保存 (Ctrl+S)")
+
+        for btn in (self._btn_copy, self._btn_quicksave, self._btn_save):
+            btn.setEnabled(False)
+
+        # ⚙ 設定メニュー（保存先・保存設定・ホットキー設定をまとめる）
+        self._btn_settings = QPushButton("⚙ 設定")
+        settings_menu = QMenu(self)
+        self._action_folder = settings_menu.addAction("保存先...", self._on_choose_folder)
+        settings_menu.addAction("保存設定...", self._on_save_options)
+        settings_menu.addAction("ホットキー設定...", self._on_hotkey_settings)
+        self._btn_settings.setMenu(settings_menu)
+
+        # プロファイル（右端）
+        sep_v = QFrame()
+        sep_v.setFrameShape(QFrame.Shape.VLine)
+        sep_v.setFrameShadow(QFrame.Shadow.Sunken)
+        lbl_profile = QLabel("プロファイル:")
+        self._combo_profile = QComboBox()
+        self._combo_profile.setMinimumWidth(110)
+        self._combo_profile.setToolTip("使用するプロファイルを選択")
+        self._btn_profile_mgr = QPushButton("管理...")
+        self._btn_profile_mgr.setToolTip("プロファイルの追加・削除・設定変更")
 
         self._btn_full.clicked.connect(self._on_capture_full)
         self._btn_region.clicked.connect(self._on_capture_region)
@@ -101,19 +135,16 @@ class MainWindow(QMainWindow):
         self._btn_copy.clicked.connect(self._on_copy_clipboard)
         self._btn_save.clicked.connect(self._on_save)
         self._btn_quicksave.clicked.connect(self._on_quicksave)
-        self._btn_folder.clicked.connect(self._on_choose_folder)
-        self._btn_save_options.clicked.connect(self._on_save_options)
-        self._btn_hotkey_settings.clicked.connect(self._on_hotkey_settings)
         self._combo_profile.currentTextChanged.connect(self._on_profile_changed)
         self._btn_profile_mgr.clicked.connect(self._on_profile_manage)
         self._refresh_profile_combo()
 
         for w in (self._btn_full, self._btn_region, self._btn_window,
                   lbl_delay, self._spin_delay,
-                  self._btn_copy,
-                  self._btn_folder, self._lbl_folder,
-                  self._btn_quicksave, self._btn_save, self._btn_save_options,
-                  self._btn_hotkey_settings,
+                  self._btn_copy, self._btn_quicksave, self._btn_save):
+            cb_layout.addWidget(w)
+        cb_layout.addStretch()
+        for w in (self._btn_settings, sep_v,
                   lbl_profile, self._combo_profile, self._btn_profile_mgr):
             cb_layout.addWidget(w)
 
@@ -124,11 +155,16 @@ class MainWindow(QMainWindow):
         eb_layout.setSpacing(6)
 
         # ツール選択ボタン（トグル）
-        self._btn_tool_none = QPushButton("選択解除")
+        self._btn_tool_none = QPushButton("閲覧")
+        self._btn_tool_none.setToolTip("閲覧モード — スクロール・確認のみ (V)")
         self._btn_tool_select = QPushButton("▶ 選択")
+        self._btn_tool_select.setToolTip("選択ツール — クリックで選択/ドラッグで移動 (S)")
         self._btn_tool_rect = QPushButton("■ 矩形")
+        self._btn_tool_rect.setToolTip("矩形ツール — ドラッグで枠線を描画 (R)")
         self._btn_tool_filled_rect = QPushButton("█ 四角形")
+        self._btn_tool_filled_rect.setToolTip("塗りつぶし四角形ツール — ドラッグで描画 (F)")
         self._btn_tool_text = QPushButton("T テキスト")
+        self._btn_tool_text.setToolTip("テキストツール — ダブルクリックで文字を入力 (T)")
         self._tool_buttons = {
             None: self._btn_tool_none,
             "select": self._btn_tool_select,
@@ -142,7 +178,8 @@ class MainWindow(QMainWindow):
 
         # 色ピッカー
         self._btn_color = QPushButton("  色")
-        self._btn_color.setIcon(_color_icon(self._current_color))
+        self._btn_color.setIcon(color_icon(self._current_color))
+        self._btn_color.setToolTip("描画色を選択（選択中のオブジェクトがあれば色を変更）")
         self._btn_color.clicked.connect(self._on_pick_color)
 
         # 線幅
@@ -151,21 +188,41 @@ class MainWindow(QMainWindow):
         self._spin_width.setRange(1, 20)
         self._spin_width.setValue(2)
         self._spin_width.setSuffix(" px")
+        self._spin_width.setToolTip("矩形の線幅")
         self._spin_width.valueChanged.connect(self._on_line_width_changed)
 
-        # Undo
+        # フォントサイズ
+        lbl_font = QLabel("フォント:")
+        self._spin_font_size = QSpinBox()
+        self._spin_font_size.setRange(8, 120)
+        self._spin_font_size.setValue(16)
+        self._spin_font_size.setSuffix(" px")
+        self._spin_font_size.setToolTip("テキストのフォントサイズ")
+        self._spin_font_size.valueChanged.connect(self._on_font_size_changed)
+
+        # Undo / Redo
         self._btn_undo = QPushButton("↩ Undo [Ctrl+Z]")
+        self._btn_undo.setToolTip("直前の操作を元に戻す (Ctrl+Z)")
         self._btn_undo.setEnabled(False)
         self._btn_undo.clicked.connect(self._on_undo)
 
-        # セパレータ
-        sep = QFrame()
-        sep.setFrameShape(QFrame.Shape.VLine)
-        sep.setFrameShadow(QFrame.Shadow.Sunken)
+        self._btn_redo = QPushButton("↪ Redo [Ctrl+Y]")
+        self._btn_redo.setToolTip("操作をやり直す (Ctrl+Y)")
+        self._btn_redo.setEnabled(False)
+        self._btn_redo.clicked.connect(self._on_redo)
 
-        for w in (self._btn_tool_none, self._btn_tool_select, self._btn_tool_rect, self._btn_tool_filled_rect, self._btn_tool_text,
-                  sep, self._btn_color, lbl_width, self._spin_width,
-                  sep, self._btn_undo):
+        def _make_sep():
+            s = QFrame()
+            s.setFrameShape(QFrame.Shape.VLine)
+            s.setFrameShadow(QFrame.Shadow.Sunken)
+            return s
+
+        for w in (self._btn_tool_none, self._btn_tool_select, self._btn_tool_rect,
+                  self._btn_tool_filled_rect, self._btn_tool_text,
+                  _make_sep(), self._btn_color,
+                  lbl_width, self._spin_width,
+                  lbl_font, self._spin_font_size,
+                  _make_sep(), self._btn_undo, self._btn_redo):
             eb_layout.addWidget(w)
         eb_layout.addStretch()
 
@@ -175,6 +232,8 @@ class MainWindow(QMainWindow):
         # ========== キャンバス ==========
         self._canvas = EditorCanvas()
         self._canvas.set_tool(None)
+        self._canvas.undo_stack_changed.connect(self._update_undo_button)
+        self._canvas.redo_stack_changed.connect(self._update_redo_button)
 
         # ========== 中央ウィジェット ==========
         central = QWidget()
@@ -189,7 +248,7 @@ class MainWindow(QMainWindow):
         # ========== ステータスバー ==========
         self._status = QStatusBar()
         self.setStatusBar(self._status)
-        self._status.showMessage("F1: 全画面  F2: 範囲選択")
+        self._status.showMessage("F1: 全画面  F2: 範囲選択  F3: ウィンドウ")
 
     def _setup_shortcuts(self):
         QShortcut(QKeySequence("F1"), self, self._on_capture_full)
@@ -199,7 +258,14 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+S"), self, self._on_save)
         QShortcut(QKeySequence("Ctrl+Shift+S"), self, self._on_quicksave)
         QShortcut(QKeySequence("Ctrl+Z"), self, self._on_undo)
+        QShortcut(QKeySequence("Ctrl+Y"), self, self._on_redo)
         QShortcut(QKeySequence("Delete"), self, self._on_delete_selected)
+        # ツール切り替えショートカット
+        QShortcut(QKeySequence("V"), self, lambda: self._on_select_tool(None))
+        QShortcut(QKeySequence("S"), self, lambda: self._on_select_tool("select"))
+        QShortcut(QKeySequence("R"), self, lambda: self._on_select_tool("rect"))
+        QShortcut(QKeySequence("F"), self, lambda: self._on_select_tool("filled_rect"))
+        QShortcut(QKeySequence("T"), self, lambda: self._on_select_tool("text"))
 
     # ------------------------------------------------------------------
     # キャプチャ
@@ -250,21 +316,36 @@ class MainWindow(QMainWindow):
         self._start_countdown(self._do_start_window)
 
     def _do_start_window(self):
-        self._selector = start_window_capture(self._on_region_captured)
+        self._release_selector()
+        self._selector = start_window_capture(self._on_region_captured, self._on_capture_cancelled)
 
     def _do_start_region(self):
-        self._selector = capture.start_region_capture(self._on_region_captured)
+        self._release_selector()
+        self._selector = capture.start_region_capture(self._on_region_captured, self._on_capture_cancelled)
+
+    def _release_selector(self):
+        """前回のセレクタウィジェットを解放する。"""
+        if self._selector is not None:
+            self._selector.deleteLater()
+            self._selector = None
 
     def _on_region_captured(self, pixmap: QPixmap):
         self.showNormal()
         self.activateWindow()
         self._set_pixmap(pixmap)
 
+    def _on_capture_cancelled(self):
+        """範囲選択 / ウィンドウ選択がEscでキャンセルされたときにメインウィンドウを復元する。"""
+        self.showNormal()
+        self.activateWindow()
+        self._status.showMessage("キャプチャをキャンセルしました")
+
     def _set_pixmap(self, pixmap: QPixmap):
         self._canvas.set_pixmap(pixmap)
         for btn in (self._btn_copy, self._btn_save, self._btn_quicksave):
             btn.setEnabled(True)
         self._btn_undo.setEnabled(False)
+        self._btn_redo.setEnabled(False)
         if self._config.get("auto_backup_enabled", True):
             self._auto_backup(pixmap)
         self._status.showMessage(
@@ -274,11 +355,15 @@ class MainWindow(QMainWindow):
 
     def _auto_backup(self, pixmap: QPixmap):
         """無編集の元画像をバックアップフォルダへ自動保存する。"""
+        import logging
         backup_dir = Path(self._config["save_folder"]) / "backup"
         backup_dir.mkdir(parents=True, exist_ok=True)
         path = self._make_filename(backup_dir, "png")
-        pixmap.save(str(path), "PNG")
-        self._backup_path = path
+        if pixmap.save(str(path), "PNG"):
+            self._backup_path = path
+        else:
+            self._backup_path = None
+            logging.getLogger(__name__).warning("バックアップ保存に失敗しました: %s", path)
 
     # ------------------------------------------------------------------
     # 編集ツール
@@ -307,7 +392,7 @@ class MainWindow(QMainWindow):
             self._status.showMessage("選択オブジェクトの色を変更しました")
         else:
             self._current_color = color
-            self._btn_color.setIcon(_color_icon(color))
+            self._btn_color.setIcon(color_icon(color))
             self._canvas.set_color(color)
 
     def _on_delete_selected(self):
@@ -318,9 +403,32 @@ class MainWindow(QMainWindow):
     def _on_line_width_changed(self, value: int):
         self._canvas.set_line_width(value)
 
+    def _on_font_size_changed(self, value: int):
+        self._canvas.set_font_size(value)
+
+    def _update_undo_button(self, count: int):
+        if count > 0:
+            self._btn_undo.setText(f"↩ Undo ({count}) [Ctrl+Z]")
+            self._btn_undo.setEnabled(True)
+        else:
+            self._btn_undo.setText("↩ Undo [Ctrl+Z]")
+            self._btn_undo.setEnabled(False)
+
+    def _update_redo_button(self, count: int):
+        if count > 0:
+            self._btn_redo.setText(f"↪ Redo ({count}) [Ctrl+Y]")
+            self._btn_redo.setEnabled(True)
+        else:
+            self._btn_redo.setText("↪ Redo [Ctrl+Y]")
+            self._btn_redo.setEnabled(False)
+
     def _on_undo(self):
         if self._canvas.undo():
             self._status.showMessage("Undo しました")
+
+    def _on_redo(self):
+        if self._canvas.redo():
+            self._status.showMessage("Redo しました")
 
     # ------------------------------------------------------------------
     # クリップボード
@@ -336,6 +444,20 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # 保存
     # ------------------------------------------------------------------
+
+    def _show_toast(self, message: str, duration_ms: int = 2500):
+        """ウィンドウ下部中央に短時間表示するトースト通知。"""
+        toast = QLabel(message, self)
+        toast.setStyleSheet(
+            "background: rgba(30,30,30,210); color: white;"
+            "border-radius: 6px; padding: 8px 16px; font-size: 13px;"
+        )
+        toast.adjustSize()
+        toast.move((self.width() - toast.width()) // 2,
+                   self.height() - toast.height() - 56)
+        toast.show()
+        toast.raise_()
+        QTimer.singleShot(duration_ms, toast.deleteLater)
 
     def _make_filename(self, folder: Path, ext: str = "png") -> Path:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -356,6 +478,7 @@ class MainWindow(QMainWindow):
         folder.mkdir(parents=True, exist_ok=True)
         path = self._make_filename(folder, "png")
         if pixmap.save(str(path), "PNG"):
+            self._show_toast(f"保存しました: {path.name}")
             self._status.showMessage(f"保存しました: {path}")
             if self._config.get("open_folder_after_save", False):
                 os.startfile(str(folder))
@@ -379,6 +502,7 @@ class MainWindow(QMainWindow):
         fmt = "PNG" if path.lower().endswith(".png") else "JPEG"
         if pixmap.save(path, fmt):
             self._rename_backup(Path(path))
+            self._show_toast(f"保存しました: {Path(path).name}")
             self._status.showMessage(f"保存しました: {path}")
             if self._config.get("open_folder_after_save", False):
                 os.startfile(str(Path(path).parent))
@@ -386,26 +510,8 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "エラー", f"保存に失敗しました:\n{path}")
 
     def _apply_save_effects(self, pixmap: QPixmap) -> QPixmap:
-        """保存時自動エフェクトを適用した画像を返す。設定が無効なら元画像をそのまま返す。"""
-        if not self._config.get("auto_border_enabled", False):
-            return pixmap
-
-        result = pixmap.copy()
-        from PySide6.QtGui import QPainter, QPen, QColor
-        from PySide6.QtCore import Qt
-        painter = QPainter(result)
-        w = self._config.get("auto_border_width", 4)
-        color = QColor(self._config.get("auto_border_color", "#ff0000"))
-        pen = QPen(color, w)
-        pen.setJoinStyle(Qt.PenJoinStyle.MiterJoin)
-        painter.setPen(pen)
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        # 線幅の半分が内側にはみ出すので offset で調整
-        offset = w // 2
-        painter.drawRect(offset, offset,
-                         result.width() - w, result.height() - w)
-        painter.end()
-        return result
+        """保存時自動エフェクトを適用した画像を返す。"""
+        return _apply_border_effect(pixmap, self._config)
 
     def _on_save_options(self):
         dlg = SaveOptionsDialog(self._config, self)
@@ -461,9 +567,11 @@ class MainWindow(QMainWindow):
         if action == "full":
             QTimer.singleShot(300, self._do_capture_full_with_profile)
         elif action == "region":
-            QTimer.singleShot(300, lambda: capture.start_region_capture(self._on_region_captured_with_profile))
+            QTimer.singleShot(300, lambda: capture.start_region_capture(
+                self._on_region_captured_with_profile, self._on_capture_cancelled))
         elif action == "window":
-            QTimer.singleShot(300, lambda: start_window_capture(self._on_region_captured_with_profile))
+            QTimer.singleShot(300, lambda: start_window_capture(
+                self._on_region_captured_with_profile, self._on_capture_cancelled))
 
     def _do_capture_full_with_profile(self):
         pixmap = capture.capture_fullscreen()
@@ -485,25 +593,13 @@ class MainWindow(QMainWindow):
             pixmap.save(str(self._make_filename(backup_dir, "png")), "PNG")
 
         # エフェクト適用
-        result = pixmap
-        if prof.get("auto_border_enabled", False):
-            from PySide6.QtGui import QPainter, QPen
-            result = pixmap.copy()
-            painter = QPainter(result)
-            w = prof.get("auto_border_width", 4)
-            color = QColor(prof.get("auto_border_color", "#ff0000"))
-            pen = QPen(color, w)
-            pen.setJoinStyle(Qt.PenJoinStyle.MiterJoin)
-            painter.setPen(pen)
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            offset = w // 2
-            painter.drawRect(offset, offset, result.width() - w, result.height() - w)
-            painter.end()
+        result = _apply_border_effect(pixmap, prof)
 
         folder = Path(prof["save_folder"])
         folder.mkdir(parents=True, exist_ok=True)
         path = self._make_filename(folder, "png")
         if result.save(str(path), "PNG"):
+            self._show_toast(f"保存しました: {path.name}")
             self._status.showMessage(f"保存しました [{prof.get('save_folder', '')}]: {path.name}")
             if prof.get("open_folder_after_save", False):
                 os.startfile(str(folder))
@@ -548,7 +644,5 @@ class MainWindow(QMainWindow):
 
     def _update_folder_label(self):
         folder = self._config["save_folder"]
-        max_len = 45
-        display = folder if len(folder) <= max_len else "..." + folder[-(max_len - 3):]
-        self._lbl_folder.setText(display)
-        self._lbl_folder.setToolTip(folder)
+        self._action_folder.setText(f"保存先: {folder}")
+        self._btn_settings.setToolTip(f"保存先: {folder}")

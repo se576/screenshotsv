@@ -1,10 +1,13 @@
-import copy
-
-from PySide6.QtCore import Qt, QRect, QPoint, QSize
-from PySide6.QtGui import QPixmap, QPainter, QColor, QPen, QFont, QCursor
+from PySide6.QtCore import Qt, QRect, QPoint, QSize, Signal
+from PySide6.QtGui import QPixmap, QPainter, QColor, QPen, QFont, QCursor, QFontMetrics
 from PySide6.QtWidgets import QWidget, QSizePolicy, QInputDialog
 
 from app.annotations import RectAnnotation, FilledRectAnnotation, TextAnnotation, Annotation
+
+def _copy_annotations(annotations: list) -> list:
+    """PySide6 オブジェクトを含む Annotation リストを安全にコピーする。"""
+    return [ann.copy() for ann in annotations]
+
 
 HANDLE_SIZE = 10  # リサイズハンドルのサイズ（canvas px）
 HANDLE_HALF = HANDLE_SIZE // 2
@@ -17,11 +20,19 @@ class EditorCanvas(QWidget):
     ツール: "select" | "rect" | "filled_rect" | "text" | None
     """
 
+    undo_stack_changed = Signal(int)  # Undoスタックのサイズを emit
+    redo_stack_changed = Signal(int)  # Redoスタックのサイズを emit
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._pixmap: QPixmap | None = None
         self._annotations: list[Annotation] = []
         self._undo_stack: list[list[Annotation]] = []
+        self._redo_stack: list[list[Annotation]] = []
+
+        # スケール済みキャッシュ（paintEvent の二重スケール防止）
+        self._scaled_cache: QPixmap | None = None
+        self._scaled_cache_size: QSize | None = None
 
         # ツール設定
         self._active_tool: str | None = None
@@ -53,10 +64,15 @@ class EditorCanvas(QWidget):
         self._pixmap = pixmap
         self._annotations.clear()
         self._undo_stack.clear()
+        self._redo_stack.clear()
+        self._scaled_cache = None
+        self._scaled_cache_size = None
         self._drag_start = None
         self._drag_end = None
         self._selected_idx = None
         self._drag_mode = None
+        self.undo_stack_changed.emit(0)
+        self.redo_stack_changed.emit(0)
         self.update()
 
     def get_pixmap(self) -> QPixmap | None:
@@ -85,11 +101,28 @@ class EditorCanvas(QWidget):
     def set_line_width(self, width: int) -> None:
         self._line_width = width
 
+    def set_font_size(self, size: int) -> None:
+        self._font_size = size
+
     def undo(self) -> bool:
         if not self._undo_stack:
             return False
+        self._redo_stack.append(_copy_annotations(self._annotations))
         self._annotations = self._undo_stack.pop()
         self._selected_idx = None
+        self.undo_stack_changed.emit(len(self._undo_stack))
+        self.redo_stack_changed.emit(len(self._redo_stack))
+        self.update()
+        return True
+
+    def redo(self) -> bool:
+        if not self._redo_stack:
+            return False
+        self._undo_stack.append(_copy_annotations(self._annotations))
+        self._annotations = self._redo_stack.pop()
+        self._selected_idx = None
+        self.undo_stack_changed.emit(len(self._undo_stack))
+        self.redo_stack_changed.emit(len(self._redo_stack))
         self.update()
         return True
 
@@ -121,17 +154,36 @@ class EditorCanvas(QWidget):
         self.update()
 
     # ------------------------------------------------------------------
+    # 内部: スケールキャッシュ
+    # ------------------------------------------------------------------
+
+    def _get_scaled(self) -> QPixmap | None:
+        """スケール済みキャッシュを返す。ウィジェットサイズが変わったら再計算する。"""
+        if self._pixmap is None:
+            return None
+        if self._scaled_cache is None or self._scaled_cache_size != self.size():
+            self._scaled_cache = self._pixmap.scaled(
+                self.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            self._scaled_cache_size = self.size()
+        return self._scaled_cache
+
+    def resizeEvent(self, event):
+        # サイズ変更でキャッシュを無効化
+        self._scaled_cache = None
+        self._scaled_cache_size = None
+        super().resizeEvent(event)
+
+    # ------------------------------------------------------------------
     # 内部: 座標変換
     # ------------------------------------------------------------------
 
     def _image_rect(self) -> QRect:
-        if self._pixmap is None:
+        scaled = self._get_scaled()
+        if scaled is None:
             return QRect()
-        scaled = self._pixmap.scaled(
-            self.size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
         x = (self.width() - scaled.width()) // 2
         y = (self.height() - scaled.height()) // 2
         return QRect(x, y, scaled.width(), scaled.height())
@@ -170,7 +222,7 @@ class EditorCanvas(QWidget):
     # ------------------------------------------------------------------
 
     def _ann_canvas_rect(self, ann: Annotation) -> QRect:
-        """アノテーションのキャンバス上の矩形を返す（テキストは推定）。"""
+        """アノテーションのキャンバス上の矩形を返す。"""
         if isinstance(ann, (RectAnnotation, FilledRectAnnotation)):
             return self._image_to_canvas_rect(ann.rect)
         elif isinstance(ann, TextAnnotation):
@@ -181,8 +233,14 @@ class EditorCanvas(QWidget):
             sy = ir.height() / self._pixmap.height()
             cx = int(ann.pos.x() * sx + ir.x())
             cy = int(ann.pos.y() * sy + ir.y())
-            est_w = max(ann.font_size * len(ann.text), 30)
-            return QRect(cx, cy - ann.font_size, est_w, ann.font_size + 4)
+            # QFontMetrics でテキスト幅を正確に推定
+            font = QFont()
+            font.setPixelSize(max(1, int(ann.font_size * sy)))
+            font.setBold(True)
+            fm = QFontMetrics(font)
+            est_w = fm.horizontalAdvance(ann.text)
+            est_h = fm.height()
+            return QRect(cx, cy - est_h, est_w, est_h + 4)
         return QRect()
 
     def _handle_rects(self, canvas_rect: QRect) -> dict[str, QRect]:
@@ -279,15 +337,11 @@ class EditorCanvas(QWidget):
         painter = QPainter(self)
         painter.fillRect(self.rect(), Qt.GlobalColor.darkGray)
 
-        if not self._pixmap:
+        scaled = self._get_scaled()
+        if scaled is None:
             return
 
         ir = self._image_rect()
-        scaled = self._pixmap.scaled(
-            self.size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
         painter.drawPixmap(ir.x(), ir.y(), scaled)
 
         # アノテーション描画（画像スケール空間）
@@ -331,7 +385,7 @@ class EditorCanvas(QWidget):
             if handle:
                 self._drag_mode = f"resize_{handle}"
                 self._drag_start_pos = pos
-                self._drag_orig_ann = copy.deepcopy(self._annotations[self._selected_idx])
+                self._drag_orig_ann = self._annotations[self._selected_idx].copy()
                 self._moved = False
                 return
 
@@ -340,7 +394,7 @@ class EditorCanvas(QWidget):
                 self._selected_idx = idx
                 self._drag_mode = "move"
                 self._drag_start_pos = pos
-                self._drag_orig_ann = copy.deepcopy(self._annotations[idx])
+                self._drag_orig_ann = self._annotations[idx].copy()
                 self._moved = False
             else:
                 self._selected_idx = None
@@ -355,17 +409,7 @@ class EditorCanvas(QWidget):
         if self._active_tool in ("rect", "filled_rect"):
             self._drag_start = pos
             self._drag_end = pos
-
-        elif self._active_tool == "text":
-            img_pos = self._canvas_to_image(pos)
-            text, ok = QInputDialog.getText(self, "テキスト入力", "テキスト:")
-            if ok and text.strip():
-                self._push_undo()
-                self._annotations.append(
-                    TextAnnotation(pos=img_pos, text=text.strip(),
-                                   color=QColor(self._color), font_size=self._font_size)
-                )
-                self.update()
+        # text ツールはダブルクリックで入力（mouseDoubleClickEvent 参照）
 
     def mouseMoveEvent(self, event):
         pos = event.position().toPoint()
@@ -415,10 +459,8 @@ class EditorCanvas(QWidget):
         if self._active_tool == "select" and self._drag_mode:
             if self._moved:
                 # undo スタックに push（ドラッグ前の状態）
-                before = self._undo_stack
-                snapshot = copy.deepcopy(self._annotations)
+                saved_current = _copy_annotations(self._annotations)
                 # orig を元に戻してからpush、その後現在値を再設定
-                saved_current = copy.deepcopy(self._annotations)
                 self._annotations[self._selected_idx] = self._drag_orig_ann
                 self._push_undo()
                 self._annotations = saved_current
@@ -457,13 +499,31 @@ class EditorCanvas(QWidget):
             self._drag_end = None
             self.update()
 
+    def mouseDoubleClickEvent(self, event):
+        if self._pixmap is None or event.button() != Qt.MouseButton.LeftButton:
+            return
+        if self._active_tool == "text":
+            pos = event.position().toPoint()
+            img_pos = self._canvas_to_image(pos)
+            text, ok = QInputDialog.getText(self, "テキスト入力", "テキスト:")
+            if ok and text.strip():
+                self._push_undo()
+                self._annotations.append(
+                    TextAnnotation(pos=img_pos, text=text.strip(),
+                                   color=QColor(self._color), font_size=self._font_size)
+                )
+                self.update()
+
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Delete:
             self.delete_selected()
 
     # ------------------------------------------------------------------
-    # Undo
+    # Undo / Redo
     # ------------------------------------------------------------------
 
     def _push_undo(self):
-        self._undo_stack.append(copy.deepcopy(self._annotations))
+        self._undo_stack.append(_copy_annotations(self._annotations))
+        self._redo_stack.clear()
+        self.undo_stack_changed.emit(len(self._undo_stack))
+        self.redo_stack_changed.emit(0)

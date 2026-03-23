@@ -1,6 +1,10 @@
 import copy
 import json
+import logging
+import warnings
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 CONFIG_DIR = Path.home() / ".screenshotsv"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -65,8 +69,10 @@ def load() -> dict:
             # グローバルホットキースロットを補完
             data.setdefault("hotkey_slots", copy.deepcopy(DEFAULT_HOTKEY_SLOTS))
             return data
-        except Exception:
-            pass
+        except json.JSONDecodeError:
+            warnings.warn(f"設定ファイルが破損しています。デフォルト設定を使用します: {CONFIG_FILE}")
+        except Exception as e:
+            warnings.warn(f"設定ファイルの読み込みに失敗しました: {e}")
     return {
         "active_profile": DEFAULT_PROFILE_NAME,
         "profiles": {DEFAULT_PROFILE_NAME: _new_profile()},
@@ -75,9 +81,17 @@ def load() -> dict:
 
 
 def save(root: dict) -> None:
+    """設定を原子的に保存する（書き込み中クラッシュによる破損を防ぐ）。"""
+    import os
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(root, f, ensure_ascii=False, indent=2)
+    tmp = CONFIG_DIR / f"config.tmp.{os.getpid()}"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(root, f, ensure_ascii=False, indent=2)
+        os.replace(str(tmp), str(CONFIG_FILE))
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 # ------------------------------------------------------------------

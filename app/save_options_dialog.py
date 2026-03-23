@@ -1,17 +1,13 @@
 """保存時自動エフェクトの設定ダイアログ。"""
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QIcon, QPixmap
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGroupBox,
     QCheckBox, QLabel, QSpinBox, QPushButton,
     QDialogButtonBox, QColorDialog,
 )
 
-
-def _color_icon(color: QColor, size: int = 20) -> QIcon:
-    pm = QPixmap(size, size)
-    pm.fill(color)
-    return QIcon(pm)
+from app.ui_utils import color_icon as _color_icon
 
 
 class SaveOptionsDialog(QDialog):
@@ -45,7 +41,7 @@ class SaveOptionsDialog(QDialog):
         self._btn_color = QPushButton()
         self._btn_color.setFixedSize(60, 26)
         self._btn_color.setIcon(_color_icon(self._border_color))
-        self._btn_color.setText(self._border_color.name())
+        self._btn_color.setToolTip(self._border_color.name())
         self._btn_color.clicked.connect(self._pick_color)
 
         lbl_width = QLabel("幅:")
@@ -83,7 +79,7 @@ class SaveOptionsDialog(QDialog):
         if color.isValid():
             self._border_color = color
             self._btn_color.setIcon(_color_icon(color))
-            self._btn_color.setText(color.name())
+            self._btn_color.setToolTip(color.name())
 
     def get_config(self) -> dict:
         """OKが押されたときに更新済み設定を返す。"""

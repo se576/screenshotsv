@@ -4,7 +4,10 @@ keyboard ライブラリのフックは別スレッドで動くため、
 コールバックでは Signal.emit() のみ実行して Qt UI スレッドに転送する。
 """
 import keyboard
+import logging
 from PySide6.QtCore import QObject, Signal
+
+logger = logging.getLogger(__name__)
 
 # アクションキーとラベル
 ACTIONS = {
@@ -53,16 +56,16 @@ class HotkeyManager(QObject):
                         suppress=False,
                     )
                 self._registered.append(combo)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("ホットキー登録失敗: combo=%r action=%r: %s", combo, action, e)
 
     def stop(self) -> None:
         """登録済みのホットキーをすべて解除する。"""
         for combo in self._registered:
             try:
                 keyboard.remove_hotkey(combo)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("ホットキー解除失敗: combo=%r: %s", combo, e)
         self._registered.clear()
 
     def update(self, slots: list) -> None:

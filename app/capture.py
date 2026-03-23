@@ -3,10 +3,22 @@ from PySide6.QtGui import QPixmap, QPainter, QColor, QPen, QCursor, QFont
 from PySide6.QtWidgets import QApplication, QWidget
 
 
+def _virtual_geometry() -> QRect:
+    """全モニターを包含する仮想デスクトップの矩形を返す。"""
+    screens = QApplication.screens()
+    if not screens:
+        return QApplication.primaryScreen().geometry()
+    rect = screens[0].geometry()
+    for s in screens[1:]:
+        rect = rect.united(s.geometry())
+    return rect
+
+
 def capture_fullscreen() -> QPixmap:
-    """全画面をキャプチャして返す。"""
+    """全画面（全モニター）をキャプチャして返す。"""
+    vg = _virtual_geometry()
     screen = QApplication.primaryScreen()
-    return screen.grabWindow(0)
+    return screen.grabWindow(0, vg.x(), vg.y(), vg.width(), vg.height())
 
 
 class RegionSelector(QWidget):
@@ -15,15 +27,13 @@ class RegionSelector(QWidget):
     選択中はドラッグ範囲のサイズをリアルタイム表示する。
     """
 
-    def __init__(self, background: QPixmap, callback):
+    def __init__(self, background: QPixmap, callback, cancel_callback=None):
         super().__init__()
         self._bg = background
         self._callback = callback
+        self._cancel_callback = cancel_callback
         self._start: QPoint | None = None
         self._end: QPoint | None = None
-
-        screen = QApplication.primaryScreen().geometry()
-        self.setGeometry(screen)
 
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
@@ -96,14 +106,18 @@ class RegionSelector(QWidget):
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape:
             self.close()
+            if self._cancel_callback:
+                self._cancel_callback()
 
 
-def start_region_capture(callback):
+def start_region_capture(callback, cancel_callback=None):
     """
     全画面をキャプチャしてオーバーレイとして表示し、範囲選択を開始する。
-    選択完了後、callbackにQPixmapを渡す。
+    選択完了後、callbackにQPixmapを渡す。Escキャンセル時はcancel_callbackを呼ぶ。
     """
-    bg = QApplication.primaryScreen().grabWindow(0)
-    selector = RegionSelector(bg, callback)
-    selector.showFullScreen()
+    vg = _virtual_geometry()
+    bg = QApplication.primaryScreen().grabWindow(0, vg.x(), vg.y(), vg.width(), vg.height())
+    selector = RegionSelector(bg, callback, cancel_callback)
+    selector.setGeometry(vg)
+    selector.show()
     return selector

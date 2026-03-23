@@ -2,7 +2,7 @@
 import copy
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QIcon, QPixmap
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGroupBox,
     QListWidget, QListWidgetItem, QPushButton, QLabel,
@@ -12,12 +12,7 @@ from PySide6.QtWidgets import (
 )
 
 from app import settings as S
-
-
-def _color_icon(color: QColor, size: int = 16) -> QIcon:
-    pm = QPixmap(size, size)
-    pm.fill(color)
-    return QIcon(pm)
+from app.ui_utils import color_icon as _color_icon
 
 
 class ProfileDialog(QDialog):
