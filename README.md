@@ -73,7 +73,7 @@ Python + PySide6 製。外部サービス不要、撮影・注釈・保存をす
 pip install -r requirements.txt
 
 # 起動
-python main.py
+python screenshotsv.py
 ```
 
 > **注意**: `keyboard` ライブラリはグローバルホットキーの登録に管理者権限が必要な場合があります。
@@ -92,7 +92,7 @@ python main.py
 
 ```
 screenshotsv/
-├── main.py                  # エントリポイント
+├── screenshotsv.py          # エントリポイント
 ├── requirements.txt
 └── app/
     ├── main_window.py       # メインウィンドウ
