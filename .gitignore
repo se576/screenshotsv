@@ -4,3 +4,7 @@ __pycache__/
 .venv/
 venv/
 tasks/
+起動.bat
+dist/
+build/
+*.spec
