@@ -5,16 +5,38 @@ EnumWindows でZ順にウィンドウ一覧を事前取得し、
 """
 import ctypes
 import ctypes.wintypes
+import logging
 from dataclasses import dataclass
 
 from PySide6.QtCore import Qt, QRect, QPoint
 from PySide6.QtGui import QPixmap, QPainter, QColor, QPen, QFont, QCursor
 from PySide6.QtWidgets import QApplication, QWidget
 
-from app.capture import _virtual_geometry
+from app.capture import virtual_geometry
+
+logger = logging.getLogger(__name__)
 
 _user32 = ctypes.windll.user32
+_dwmapi = ctypes.windll.dwmapi
 _WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+_DWMWA_EXTENDED_FRAME_BOUNDS = 9
+
+
+def _get_window_rect(hwnd: int) -> ctypes.wintypes.RECT:
+    """
+    DwmGetWindowAttribute で実際の表示境界を取得する（ウィンドウ影を除いた正確な境界）。
+    DWMが無効な場合は GetWindowRect にフォールバック。
+    """
+    rect = ctypes.wintypes.RECT()
+    hr = _dwmapi.DwmGetWindowAttribute(
+        hwnd,
+        _DWMWA_EXTENDED_FRAME_BOUNDS,
+        ctypes.byref(rect),
+        ctypes.sizeof(rect),
+    )
+    if hr != 0:
+        _user32.GetWindowRect(hwnd, ctypes.byref(rect))
+    return rect
 
 
 @dataclass
@@ -38,8 +60,7 @@ def _enum_visible_windows() -> list[WindowInfo]:
         if _user32.IsIconic(hwnd):
             return True
 
-        rect = ctypes.wintypes.RECT()
-        _user32.GetWindowRect(hwnd, ctypes.byref(rect))
+        rect = _get_window_rect(hwnd)
         w = rect.right - rect.left
         h = rect.bottom - rect.top
         if w <= 0 or h <= 0:
@@ -58,7 +79,9 @@ def _enum_visible_windows() -> list[WindowInfo]:
         ))
         return True
 
-    _user32.EnumWindows(_WNDENUMPROC(callback), 0)
+    ret = _user32.EnumWindows(_WNDENUMPROC(callback), 0)
+    if not ret and not results:
+        logger.warning("EnumWindows が失敗しました (戻り値: %d)", ret)
     return results  # Z順: インデックスが小さいほど前面
 
 
@@ -79,6 +102,7 @@ class WindowSelector(QWidget):
         self._callback = callback
         self._cancel_callback = cancel_callback
         self._current: WindowInfo | None = None
+        self._vg = virtual_geometry()  # paintEvent キャッシュ
 
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
@@ -90,12 +114,23 @@ class WindowSelector(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
+        self.activateWindow()
+        self.setFocus()
+        self.grabKeyboard()
         # 初期カーソル位置でウィンドウを特定
         cursor_pos = QCursor.pos()
         win = _find_window_at(self._windows, cursor_pos)
         if win is not self._current:
             self._current = win
             self.update()
+
+    def closeEvent(self, event):
+        self.releaseKeyboard()
+        super().closeEvent(event)
+
+    def hideEvent(self, event):
+        self.releaseKeyboard()
+        super().hideEvent(event)
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -104,8 +139,7 @@ class WindowSelector(QWidget):
 
         if self._current:
             # 仮想デスクトップ内でのウィンドウ矩形をウィジェット座標に変換
-            vg = _virtual_geometry()
-            r = self._current.rect.translated(-vg.x(), -vg.y())
+            r = self._current.rect.translated(-self._vg.x(), -self._vg.y())
 
             # 選択ウィンドウ領域を明るく再描画
             painter.drawPixmap(r, self._bg, r)
@@ -156,11 +190,12 @@ class WindowSelector(QWidget):
         target = self._current
         self.close()
         if target:
-            vg = _virtual_geometry()
-            # ウィジェット座標で bg をコピー
+            vg = self._vg
             local_rect = target.rect.translated(-vg.x(), -vg.y())
             pixmap = self._bg.copy(local_rect)
             self._callback(pixmap)
+        elif self._cancel_callback:
+            self._cancel_callback()
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape:
@@ -172,8 +207,13 @@ class WindowSelector(QWidget):
 def start_window_capture(callback, cancel_callback=None):
     """ウィンドウ選択オーバーレイを起動する。選択後 callback に QPixmap を渡す。"""
     windows = _enum_visible_windows()
-    vg = _virtual_geometry()
-    bg = QApplication.primaryScreen().grabWindow(0, vg.x(), vg.y(), vg.width(), vg.height())
+    vg = virtual_geometry()
+    screen = QApplication.primaryScreen()
+    if screen is None:
+        if cancel_callback:
+            cancel_callback()
+        return None
+    bg = screen.grabWindow(0, vg.x(), vg.y(), vg.width(), vg.height())
     selector = WindowSelector(bg, windows, callback, cancel_callback)
     selector.setGeometry(vg)
     selector.show()

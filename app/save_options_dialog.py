@@ -81,9 +81,13 @@ class SaveOptionsDialog(QDialog):
             self._btn_color.setIcon(_color_icon(color))
             self._btn_color.setToolTip(color.name())
 
-    def get_config(self) -> dict:
-        """OKが押されたときに更新済み設定を返す。"""
+    def accept(self) -> None:
+        """OK 時に設定を確定してから閉じる。"""
         self._config["auto_border_enabled"] = self._chk_border.isChecked()
         self._config["auto_border_color"] = self._border_color.name()
         self._config["auto_border_width"] = self._spin_width.value()
+        super().accept()
+
+    def get_config(self) -> dict:
+        """accept() 後に確定済み設定を返す。"""
         return self._config

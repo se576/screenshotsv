@@ -1,9 +1,13 @@
+import copy
+import logging
 import os
+import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QPixmap, QKeySequence, QShortcut, QColor
+from PySide6.QtGui import QPixmap, QKeySequence, QShortcut, QColor, QPainter, QPen, QIcon
 from PySide6.QtWidgets import (
     QMainWindow,
     QWidget,
@@ -20,6 +24,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QComboBox,
     QMenu,
+    QSystemTrayIcon,
 )
 
 from app import capture, settings
@@ -31,13 +36,13 @@ from app.hotkeys import HotkeyManager
 from app.editor import EditorCanvas
 from app.ui_utils import color_icon
 
+logger = logging.getLogger(__name__)
+
 
 def _apply_border_effect(pixmap: QPixmap, prof: dict) -> QPixmap:
     """プロファイル設定に基づいて外枠エフェクトを適用する。無効なら元画像を返す。"""
     if not prof.get("auto_border_enabled", False):
         return pixmap
-    from PySide6.QtGui import QPainter, QPen
-    from PySide6.QtCore import Qt
     result = pixmap.copy()
     painter = QPainter(result)
     w = prof.get("auto_border_width", 4)
@@ -64,10 +69,11 @@ class MainWindow(QMainWindow):
         self._countdown_timer: QTimer | None = None
         self._countdown_remaining: int = 0
         self._countdown_action = None
-        self._pending_capture_profile: dict | None = None
+        self._tray: QSystemTrayIcon | None = None
         self._setup_ui()
         self._setup_shortcuts()
         self._start_hotkeys()
+        self._setup_tray()
 
     @property
     def _config(self) -> dict:
@@ -282,6 +288,12 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(300, action)
             return
 
+        # 前回のカウントダウンが残っていれば停止
+        if self._countdown_timer is not None:
+            self._countdown_timer.stop()
+            self._countdown_timer.deleteLater()
+            self._countdown_timer = None
+
         self._countdown_remaining = secs
         self._countdown_action = action
         self._countdown_timer = QTimer(self)
@@ -295,24 +307,36 @@ class MainWindow(QMainWindow):
             self._status.showMessage(f"キャプチャまで {self._countdown_remaining} 秒...")
         else:
             self._countdown_timer.stop()
+            self._countdown_timer = None
             self._countdown_action()
 
+    def _set_capture_buttons_enabled(self, enabled: bool):
+        for btn in (self._btn_full, self._btn_region, self._btn_window):
+            btn.setEnabled(enabled)
+
     def _on_capture_full(self):
-        self.showMinimized()
+        self._set_capture_buttons_enabled(False)
+        if not self.isMinimized():
+            self.showMinimized()
         self._start_countdown(self._do_capture_full)
 
     def _do_capture_full(self):
         pixmap = capture.capture_fullscreen()
+        self._set_capture_buttons_enabled(True)
         self.showNormal()
         self.activateWindow()
         self._set_pixmap(pixmap)
 
     def _on_capture_region(self):
-        self.showMinimized()
+        self._set_capture_buttons_enabled(False)
+        if not self.isMinimized():
+            self.showMinimized()
         self._start_countdown(self._do_start_region)
 
     def _on_capture_window(self):
-        self.showMinimized()
+        self._set_capture_buttons_enabled(False)
+        if not self.isMinimized():
+            self.showMinimized()
         self._start_countdown(self._do_start_window)
 
     def _do_start_window(self):
@@ -330,17 +354,25 @@ class MainWindow(QMainWindow):
             self._selector = None
 
     def _on_region_captured(self, pixmap: QPixmap):
+        self._set_capture_buttons_enabled(True)
         self.showNormal()
         self.activateWindow()
         self._set_pixmap(pixmap)
 
     def _on_capture_cancelled(self):
         """範囲選択 / ウィンドウ選択がEscでキャンセルされたときにメインウィンドウを復元する。"""
+        self._set_capture_buttons_enabled(True)
         self.showNormal()
         self.activateWindow()
         self._status.showMessage("キャプチャをキャンセルしました")
 
     def _set_pixmap(self, pixmap: QPixmap):
+        self._set_capture_buttons_enabled(True)
+        if pixmap is None or pixmap.isNull():
+            self.showNormal()
+            self.activateWindow()
+            self._status.showMessage("キャプチャに失敗しました")
+            return
         self._canvas.set_pixmap(pixmap)
         for btn in (self._btn_copy, self._btn_save, self._btn_quicksave):
             btn.setEnabled(True)
@@ -355,15 +387,19 @@ class MainWindow(QMainWindow):
 
     def _auto_backup(self, pixmap: QPixmap):
         """無編集の元画像をバックアップフォルダへ自動保存する。"""
-        import logging
-        backup_dir = Path(self._config["save_folder"]) / "backup"
-        backup_dir.mkdir(parents=True, exist_ok=True)
+        backup_dir = Path(self._config.get("save_folder", str(Path.home() / "Pictures"))) / "backup"
+        try:
+            backup_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            logger.warning("バックアップフォルダの作成に失敗しました: %s: %s", backup_dir, e)
+            self._backup_path = None
+            return
         path = self._make_filename(backup_dir, "png")
         if pixmap.save(str(path), "PNG"):
             self._backup_path = path
         else:
             self._backup_path = None
-            logging.getLogger(__name__).warning("バックアップ保存に失敗しました: %s", path)
+            logger.warning("バックアップ保存に失敗しました: %s", path)
 
     # ------------------------------------------------------------------
     # 編集ツール
@@ -462,26 +498,37 @@ class MainWindow(QMainWindow):
     def _make_filename(self, folder: Path, ext: str = "png") -> Path:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         path = folder / f"screenshot_{ts}.{ext}"
-        if path.exists():
-            for i in range(2, 100):
-                path = folder / f"screenshot_{ts}_{i}.{ext}"
-                if not path.exists():
-                    break
-        return path
+        if not path.exists():
+            return path
+        for i in range(2, 100):
+            path = folder / f"screenshot_{ts}_{i}.{ext}"
+            if not path.exists():
+                return path
+        # 100件すべて埋まっている場合はマイクロ秒で一意にする
+        ts_us = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        return folder / f"screenshot_{ts_us}.{ext}"
 
     def _on_quicksave(self):
         pixmap = self._canvas.get_pixmap()
         if pixmap is None:
             return
         pixmap = self._apply_save_effects(pixmap)
-        folder = Path(self._config["save_folder"])
-        folder.mkdir(parents=True, exist_ok=True)
+        folder = Path(self._config.get("save_folder", str(Path.home() / "Pictures")))
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            logger.warning("保存フォルダの作成に失敗しました: %s: %s", folder, e)
+            QMessageBox.critical(self, "エラー", f"保存先フォルダを作成できません:\n{folder}")
+            return
         path = self._make_filename(folder, "png")
         if pixmap.save(str(path), "PNG"):
             self._show_toast(f"保存しました: {path.name}")
             self._status.showMessage(f"保存しました: {path}")
             if self._config.get("open_folder_after_save", False):
-                os.startfile(str(folder))
+                try:
+                    os.startfile(str(folder))
+                except OSError as e:
+                    logger.warning("フォルダを開けませんでした: %s: %s", folder, e)
         else:
             QMessageBox.critical(self, "エラー", f"保存に失敗しました:\n{path}")
 
@@ -490,8 +537,13 @@ class MainWindow(QMainWindow):
         if pixmap is None:
             return
         pixmap = self._apply_save_effects(pixmap)
-        folder = Path(self._config["save_folder"])
-        folder.mkdir(parents=True, exist_ok=True)
+        folder = Path(self._config.get("save_folder", str(Path.home() / "Pictures")))
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            logger.warning("保存フォルダの作成に失敗しました: %s: %s", folder, e)
+            QMessageBox.critical(self, "エラー", f"保存先フォルダを作成できません:\n{folder}")
+            return
         default_path = self._make_filename(folder, "png")
         path, _ = QFileDialog.getSaveFileName(
             self, "名前を付けて保存", str(default_path),
@@ -505,7 +557,10 @@ class MainWindow(QMainWindow):
             self._show_toast(f"保存しました: {Path(path).name}")
             self._status.showMessage(f"保存しました: {path}")
             if self._config.get("open_folder_after_save", False):
-                os.startfile(str(Path(path).parent))
+                try:
+                    os.startfile(str(Path(path).parent))
+                except OSError as e:
+                    logger.warning("フォルダを開けませんでした: %s: %s", Path(path).parent, e)
         else:
             QMessageBox.critical(self, "エラー", f"保存に失敗しました:\n{path}")
 
@@ -513,12 +568,19 @@ class MainWindow(QMainWindow):
         """保存時自動エフェクトを適用した画像を返す。"""
         return _apply_border_effect(pixmap, self._config)
 
+    def _save_settings(self) -> None:
+        """設定を保存する。失敗してもアプリは継続する。"""
+        try:
+            settings.save(self._root)
+        except Exception as e:
+            logger.warning("設定の保存に失敗しました: %s", e)
+
     def _on_save_options(self):
         dlg = SaveOptionsDialog(self._config, self)
         if dlg.exec():
             updated = dlg.get_config()
             self._config.update(updated)
-            settings.save(self._root)
+            self._save_settings()
             self._status.showMessage("保存設定を更新しました")
 
     def _rename_backup(self, saved_path: Path):
@@ -531,8 +593,11 @@ class MainWindow(QMainWindow):
         # 同名ファイルが既にある場合は上書きしない
         if new_backup.exists():
             return
-        self._backup_path.rename(new_backup)
-        self._backup_path = new_backup
+        try:
+            self._backup_path.rename(new_backup)
+            self._backup_path = new_backup
+        except OSError as e:
+            logger.warning("バックアップのリネームに失敗しました: %s → %s: %s", self._backup_path, new_backup, e)
 
     # ------------------------------------------------------------------
     # 保存先フォルダ
@@ -543,7 +608,7 @@ class MainWindow(QMainWindow):
         self._combo_profile.clear()
         for name in settings.profile_names(self._root):
             self._combo_profile.addItem(name)
-        self._combo_profile.setCurrentText(self._root["active_profile"])
+        self._combo_profile.setCurrentText(self._root.get("active_profile", ""))
         self._combo_profile.blockSignals(False)
         self._update_folder_label()
 
@@ -558,67 +623,98 @@ class MainWindow(QMainWindow):
 
     def _on_capture_with_profile(self, action: str, profile_name: str):
         """指定プロファイルの設定でキャプチャ＋即時保存する。アクティブプロファイルは変わらない。"""
-        if profile_name not in self._root["profiles"]:
+        profiles = self._root.get("profiles", {})
+        if profile_name not in profiles:
             return
-        prof = self._root["profiles"][profile_name]
-        self._pending_capture_profile = prof
+        # deepcopy でスナップショットを取る: 300ms 待機中にプロファイル設定が変更されても影響を受けない
+        prof = copy.deepcopy(profiles[profile_name])
 
         self.showMinimized()
         if action == "full":
-            QTimer.singleShot(300, self._do_capture_full_with_profile)
+            QTimer.singleShot(300, lambda: self._do_capture_full_with_profile(prof))
         elif action == "region":
-            QTimer.singleShot(300, lambda: capture.start_region_capture(
-                self._on_region_captured_with_profile, self._on_capture_cancelled))
+            QTimer.singleShot(300, lambda: self._do_start_region_with_profile(prof))
         elif action == "window":
-            QTimer.singleShot(300, lambda: start_window_capture(
-                self._on_region_captured_with_profile, self._on_capture_cancelled))
+            QTimer.singleShot(300, lambda: self._do_start_window_with_profile(prof))
 
-    def _do_capture_full_with_profile(self):
+    def _do_start_region_with_profile(self, prof: dict):
+        self._release_selector()
+        self._selector = capture.start_region_capture(
+            lambda px: self._on_captured_with_profile(px, prof),
+            self._on_capture_cancelled)
+
+    def _do_start_window_with_profile(self, prof: dict):
+        self._release_selector()
+        self._selector = start_window_capture(
+            lambda px: self._on_captured_with_profile(px, prof),
+            self._on_capture_cancelled)
+
+    def _do_capture_full_with_profile(self, prof: dict):
         pixmap = capture.capture_fullscreen()
         self.showNormal()
         self.activateWindow()
-        self._quicksave_with_profile(pixmap, self._pending_capture_profile)
+        self._quicksave_with_profile(pixmap, prof)
 
-    def _on_region_captured_with_profile(self, pixmap: QPixmap):
+    def _on_captured_with_profile(self, pixmap: QPixmap, prof: dict):
         self.showNormal()
         self.activateWindow()
-        self._quicksave_with_profile(pixmap, self._pending_capture_profile)
+        self._quicksave_with_profile(pixmap, prof)
 
     def _quicksave_with_profile(self, pixmap: QPixmap, prof: dict):
         """指定プロファイルの設定で即時保存する。"""
+        if pixmap is None or pixmap.isNull():
+            return
+        _default_folder = str(Path.home() / "Pictures")
+        save_folder = prof.get("save_folder", _default_folder)
+
         # バックアップ
         if prof.get("auto_backup_enabled", True):
-            backup_dir = Path(prof["save_folder"]) / "backup"
-            backup_dir.mkdir(parents=True, exist_ok=True)
-            pixmap.save(str(self._make_filename(backup_dir, "png")), "PNG")
+            backup_dir = Path(save_folder) / "backup"
+            try:
+                backup_dir.mkdir(parents=True, exist_ok=True)
+                if not pixmap.save(str(self._make_filename(backup_dir, "png")), "PNG"):
+                    logger.warning("バックアップ保存に失敗しました: %s", backup_dir)
+            except OSError as e:
+                logger.warning("バックアップフォルダの作成に失敗しました: %s: %s", backup_dir, e)
 
         # エフェクト適用
         result = _apply_border_effect(pixmap, prof)
 
-        folder = Path(prof["save_folder"])
-        folder.mkdir(parents=True, exist_ok=True)
+        folder = Path(save_folder)
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            logger.warning("保存フォルダの作成に失敗しました: %s: %s", folder, e)
+            self._status.showMessage(f"保存先フォルダを作成できません: {folder}")
+            return
         path = self._make_filename(folder, "png")
         if result.save(str(path), "PNG"):
             self._show_toast(f"保存しました: {path.name}")
-            self._status.showMessage(f"保存しました [{prof.get('save_folder', '')}]: {path.name}")
+            self._status.showMessage(f"保存しました [{save_folder}]: {path.name}")
             if prof.get("open_folder_after_save", False):
-                os.startfile(str(folder))
+                try:
+                    os.startfile(str(folder))
+                except OSError as e:
+                    logger.warning("フォルダを開けませんでした: %s: %s", folder, e)
         else:
             self._status.showMessage(f"保存に失敗しました: {path}")
 
     def _on_hotkey_settings(self):
-        profile_names = settings.profile_names(self._root)
-        dlg = HotkeyDialog(self._root.get("hotkey_slots", []), profile_names, self)
-        if dlg.exec():
-            self._root["hotkey_slots"] = dlg.get_slots()
-            settings.save(self._root)
-            self._hotkey_manager.update(self._root["hotkey_slots"])
-            self._status.showMessage("ホットキー設定を更新しました")
+        self._hotkey_manager.stop()
+        try:
+            profile_names = settings.profile_names(self._root)
+            dlg = HotkeyDialog(self._root.get("hotkey_slots", []), profile_names, self)
+            if dlg.exec():
+                self._root["hotkey_slots"] = dlg.get_slots()
+                self._save_settings()
+                self._status.showMessage("ホットキー設定を更新しました")
+        finally:
+            self._hotkey_manager.update(self._root.get("hotkey_slots", []))
 
     def _on_profile_changed(self, name: str):
         if name and name in self._root["profiles"]:
             settings.set_active(self._root, name)
-            settings.save(self._root)
+            self._save_settings()
             self._update_folder_label()
             self._hotkey_manager.update(self._root.get("hotkey_slots", []))
             self._status.showMessage(f"プロファイル切り替え: {name}")
@@ -627,22 +723,201 @@ class MainWindow(QMainWindow):
         dlg = ProfileDialog(self._root, self)
         if dlg.exec():
             self._root = dlg.get_root()
-            settings.save(self._root)
+            self._save_settings()
             self._refresh_profile_combo()
             self._hotkey_manager.update(self._root.get("hotkey_slots", []))
             self._status.showMessage("プロファイルを更新しました")
 
     def _on_choose_folder(self):
         folder = QFileDialog.getExistingDirectory(
-            self, "保存先フォルダを選択", self._config["save_folder"],
+            self, "保存先フォルダを選択",
+            self._config.get("save_folder", str(Path.home() / "Pictures")),
         )
         if folder:
             self._config["save_folder"] = folder
-            settings.save(self._root)
+            self._save_settings()
             self._update_folder_label()
             self._status.showMessage(f"保存先: {folder}")
 
     def _update_folder_label(self):
-        folder = self._config["save_folder"]
+        folder = self._config.get("save_folder", str(Path.home() / "Pictures"))
         self._action_folder.setText(f"保存先: {folder}")
         self._btn_settings.setToolTip(f"保存先: {folder}")
+
+    # ------------------------------------------------------------------
+    # タスクトレイ
+    # ------------------------------------------------------------------
+
+    def _setup_tray(self):
+        """タスクトレイアイコンとメニューをセットアップする。"""
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        self._tray = QSystemTrayIcon(self._make_tray_icon(), self)
+        self._tray.setToolTip("スクリーンショット")
+
+        # QSystemTrayIcon は QMenu の所有権を持たないため self を親に指定して保持する
+        menu = QMenu(self)
+        menu.addAction("ウィンドウを開く", self._show_window)
+        menu.addSeparator()
+        menu.addAction("全画面キャプチャ", self._on_capture_full)
+        menu.addAction("範囲選択キャプチャ", self._on_capture_region)
+        menu.addAction("ウィンドウキャプチャ", self._on_capture_window)
+        menu.addSeparator()
+        # exe実行時のみスタートアップ項目を表示
+        if getattr(sys, "frozen", False):
+            self._startup_action = menu.addAction("", self._toggle_startup)
+            self._update_startup_action()
+            menu.addSeparator()
+        else:
+            self._startup_action = None
+        menu.addAction("終了", self._quit_app)
+        self._tray.setContextMenu(menu)
+
+        self._tray.activated.connect(self._on_tray_activated)
+        self._tray.show()
+
+    @staticmethod
+    def _make_tray_icon() -> QIcon:
+        """カメラ形のトレイアイコンをプログラムで生成する。"""
+        px = QPixmap(32, 32)
+        px.fill(Qt.GlobalColor.transparent)
+        p = QPainter(px)
+        try:
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            # ボディ
+            p.setBrush(QColor(60, 130, 210))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.drawRoundedRect(2, 9, 28, 19, 3, 3)
+            # ファインダー突起
+            p.drawRoundedRect(11, 5, 10, 6, 2, 2)
+            # レンズ（外）
+            p.setBrush(QColor(220, 235, 255))
+            p.drawEllipse(9, 12, 14, 14)
+            # レンズ（内）
+            p.setBrush(QColor(60, 130, 210))
+            p.drawEllipse(12, 15, 8, 8)
+            # シャッターボタン
+            p.setBrush(QColor(255, 255, 255, 180))
+            p.drawEllipse(24, 11, 4, 4)
+        finally:
+            p.end()
+        return QIcon(px)
+
+    def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason):
+        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+            self._show_window()
+
+    def _show_window(self):
+        """ウィンドウを前面に表示する。"""
+        self.showNormal()
+        self.activateWindow()
+        self.raise_()
+
+    # ------------------------------------------------------------------
+    # スタートアップ登録（タスクスケジューラ経由・管理者権限で自動起動）
+    # ------------------------------------------------------------------
+
+    _TASK_NAME = "screenshotsv_autostart"
+
+    @staticmethod
+    def _is_startup_registered() -> bool:
+        """タスクスケジューラにスタートアップタスクが登録されているか確認する。"""
+        try:
+            result = subprocess.run(
+                ["schtasks", "/query", "/tn", MainWindow._TASK_NAME],
+                capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    def _update_startup_action(self):
+        if self._startup_action is None:
+            return
+        if self._is_startup_registered():
+            self._startup_action.setText("スタートアップから削除")
+        else:
+            self._startup_action.setText("スタートアップに追加（ログオン時に自動起動）")
+
+    def _toggle_startup(self):
+        if self._is_startup_registered():
+            self._unregister_startup()
+        else:
+            self._register_startup()
+        self._update_startup_action()
+
+    def _register_startup(self):
+        """ログオン時に管理者権限で起動するタスクを登録する。"""
+        exe_path = sys.executable
+        try:
+            result = subprocess.run(
+                [
+                    "schtasks", "/create",
+                    "/tn", self._TASK_NAME,
+                    "/tr", f'"{exe_path}"',
+                    "/sc", "onlogon",
+                    "/rl", "highest",
+                    "/f",
+                ],
+                capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            if result.returncode == 0:
+                self._tray.showMessage("スクリーンショット", "スタートアップに登録しました。\n次回ログオン時から自動起動します。",
+                                       QSystemTrayIcon.MessageIcon.Information, 2500)
+            else:
+                raise RuntimeError(result.stderr.decode("cp932", errors="replace"))
+        except Exception as e:
+            logger.warning("スタートアップ登録に失敗しました: %s", e)
+            QMessageBox.warning(self, "エラー", f"スタートアップへの登録に失敗しました:\n{e}")
+
+    def _unregister_startup(self):
+        """スタートアップタスクを削除する。"""
+        try:
+            result = subprocess.run(
+                ["schtasks", "/delete", "/tn", self._TASK_NAME, "/f"],
+                capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            if result.returncode == 0:
+                self._tray.showMessage("スクリーンショット", "スタートアップから削除しました。",
+                                       QSystemTrayIcon.MessageIcon.Information, 2500)
+            else:
+                raise RuntimeError(result.stderr.decode("cp932", errors="replace"))
+        except Exception as e:
+            logger.warning("スタートアップ削除に失敗しました: %s", e)
+            QMessageBox.warning(self, "エラー", f"スタートアップからの削除に失敗しました:\n{e}")
+
+    def _quit_app(self):
+        """トレイメニューの「終了」から完全に終了する。"""
+        if self._countdown_timer is not None:
+            self._countdown_timer.stop()
+            self._countdown_timer = None
+        self._hotkey_manager.stop()
+        self._release_selector()
+        QApplication.quit()
+
+    # ------------------------------------------------------------------
+    # ウィンドウ終了
+    # ------------------------------------------------------------------
+
+    def closeEvent(self, event):
+        """×ボタンはトレイに格納する。トレイが使えない場合は終了する。"""
+        if self._tray is not None and self._tray.isVisible():
+            event.ignore()
+            if self._countdown_timer is not None:
+                self._countdown_timer.stop()
+                self._countdown_timer = None
+            self.hide()
+            self._tray.showMessage(
+                "スクリーンショット",
+                "バックグラウンドで動作しています。\nホットキーは引き続き有効です。",
+                QSystemTrayIcon.MessageIcon.Information,
+                2500,
+            )
+        else:
+            # トレイが使えない環境、またはトレイが非表示になった場合は終了する
+            if self._countdown_timer is not None:
+                self._countdown_timer.stop()
+                self._countdown_timer = None
+            self._hotkey_manager.stop()
+            self._release_selector()
+            super().closeEvent(event)

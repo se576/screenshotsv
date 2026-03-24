@@ -8,3 +8,5 @@ tasks/
 dist/
 build/
 *.spec
+.claude/
+CLAUDE.md

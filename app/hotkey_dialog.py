@@ -35,14 +35,16 @@ class KeyCaptureButton(QPushButton):
         self._update_text()
 
     def _update_text(self):
-        self.setText(self._combo if self._combo else "（なし）")
-        self.setStyleSheet("" if not self._waiting else
-                           "background-color: #fff3cd; border: 2px solid #ffc107;")
+        if self._waiting:
+            self.setText("キーを押してください...")
+            self.setStyleSheet("background-color: #fff3cd; border: 2px solid #ffc107;")
+        else:
+            self.setText(self._combo if self._combo else "（なし）")
+            self.setStyleSheet("")
 
     def _start_capture(self):
         self._waiting = True
-        self.setText("キーを押してください...")
-        self.setStyleSheet("background-color: #fff3cd; border: 2px solid #ffc107;")
+        self._update_text()
         self.setFocus()
 
     def keyPressEvent(self, event):
@@ -50,6 +52,10 @@ class KeyCaptureButton(QPushButton):
             super().keyPressEvent(event)
             return
         key = event.key()
+        if key == Qt.Key.Key_Escape:
+            self._waiting = False
+            self._update_text()
+            return
         if key in (Qt.Key.Key_Control, Qt.Key.Key_Shift,
                    Qt.Key.Key_Alt, Qt.Key.Key_Meta, Qt.Key.Key_unknown):
             return
@@ -92,8 +98,9 @@ class HotkeyDialog(QDialog):
         self._profile_names = profile_names
         self._setup_ui(slots)
 
-    def _setup_ui(self, slots: list):
-        # スロットを action × slot_idx に整理
+    @staticmethod
+    def _build_slot_map(slots: list[dict]) -> dict[str, list[dict]]:
+        """スロットリストを action → [slot, slot] の辞書に整理する（列数は常に 2）。"""
         slot_map: dict[str, list[dict]] = {a: [] for a in ACTIONS}
         for s in slots:
             action = s.get("action", "")
@@ -102,12 +109,21 @@ class HotkeyDialog(QDialog):
         for action in ACTIONS:
             while len(slot_map[action]) < 2:
                 slot_map[action].append({"action": action, "combo": "none", "profile": "__active__"})
+        return slot_map
 
-        # 列ごとのプロファイルを先頭アクションのスロットから初期値取得
-        col_profiles = [
-            slot_map[next(iter(ACTIONS))][0].get("profile", "__active__"),
-            slot_map[next(iter(ACTIONS))][1].get("profile", "__active__"),
-        ]
+    def _setup_ui(self, slots: list[dict]) -> None:
+        # スロットを action × slot_idx に整理
+        slot_map = self._build_slot_map(slots)
+
+        # 列ごとのプロファイルを全アクションのコンセンサスで初期化
+        # 列内の全アクションが同じプロファイルを持つ場合のみそれを使い、
+        # 不一致の場合は "__active__" にフォールバック
+        col_profiles = []
+        for col_idx in range(2):
+            profiles_in_col = [slot_map[action][col_idx].get("profile", "__active__")
+                               for action in ACTIONS]
+            unique = set(profiles_in_col)
+            col_profiles.append(profiles_in_col[0] if len(unique) == 1 else "__active__")
 
         layout = QVBoxLayout(self)
         layout.setSpacing(12)
@@ -187,13 +203,8 @@ class HotkeyDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
-    def _reset_defaults(self):
-        defaults = copy.deepcopy(DEFAULT_HOTKEY_SLOTS)
-        slot_map: dict[str, list[dict]] = {a: [] for a in ACTIONS}
-        for s in defaults:
-            action = s.get("action", "")
-            if action in slot_map and len(slot_map[action]) < 2:
-                slot_map[action].append(s)
+    def _reset_defaults(self) -> None:
+        slot_map = self._build_slot_map(copy.deepcopy(DEFAULT_HOTKEY_SLOTS))
         for action, btns in self._action_btns.items():
             for col_idx, btn in enumerate(btns):
                 slots = slot_map.get(action, [])
@@ -202,7 +213,7 @@ class HotkeyDialog(QDialog):
         for cb in self._col_profile_combos:
             cb.setCurrentIndex(0)
 
-    def accept(self):
+    def accept(self) -> None:
         """OK前に重複キーがないか検証する。"""
         seen: set[str] = set()
         dups: set[str] = set()
@@ -224,7 +235,7 @@ class HotkeyDialog(QDialog):
             return
         super().accept()
 
-    def get_slots(self) -> list:
+    def get_slots(self) -> list[dict]:
         """設定されたスロットリストを返す。"""
         result = []
         for action in ACTIONS:

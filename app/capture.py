@@ -3,11 +3,12 @@ from PySide6.QtGui import QPixmap, QPainter, QColor, QPen, QCursor, QFont
 from PySide6.QtWidgets import QApplication, QWidget
 
 
-def _virtual_geometry() -> QRect:
+def virtual_geometry() -> QRect:
     """全モニターを包含する仮想デスクトップの矩形を返す。"""
     screens = QApplication.screens()
     if not screens:
-        return QApplication.primaryScreen().geometry()
+        screen = QApplication.primaryScreen()
+        return screen.geometry() if screen is not None else QRect(0, 0, 1920, 1080)
     rect = screens[0].geometry()
     for s in screens[1:]:
         rect = rect.united(s.geometry())
@@ -15,9 +16,12 @@ def _virtual_geometry() -> QRect:
 
 
 def capture_fullscreen() -> QPixmap:
-    """全画面（全モニター）をキャプチャして返す。"""
-    vg = _virtual_geometry()
-    screen = QApplication.primaryScreen()
+    """全画面（全モニター）をキャプチャして返す。スクリーンが取得できない場合は isNull() が True の QPixmap を返す。"""
+    vg = virtual_geometry()
+    screens = QApplication.screens()
+    screen = QApplication.primaryScreen() or (screens[0] if screens else None)
+    if screen is None:
+        return QPixmap()
     return screen.grabWindow(0, vg.x(), vg.y(), vg.width(), vg.height())
 
 
@@ -43,6 +47,20 @@ class RegionSelector(QWidget):
         # 背景を自前で描くので TranslucentBackground は不要
         self.setCursor(QCursor(Qt.CursorShape.CrossCursor))
         self.setMouseTracking(True)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.activateWindow()
+        self.setFocus()
+        self.grabKeyboard()
+
+    def closeEvent(self, event):
+        self.releaseKeyboard()
+        super().closeEvent(event)
+
+    def hideEvent(self, event):
+        self.releaseKeyboard()
+        super().hideEvent(event)
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -98,10 +116,15 @@ class RegionSelector(QWidget):
         if event.button() == Qt.MouseButton.LeftButton and self._start:
             self._end = event.position().toPoint()
             rect = QRect(self._start, self._end).normalized()
-            self.close()
+            # close() より前に pixmap を取得する（close 後は self._bg へのアクセスが不安定になるため）
             if rect.width() > 4 and rect.height() > 4:
                 pixmap = self._bg.copy(rect)
+                self.close()
                 self._callback(pixmap)
+            else:
+                self.close()
+                if self._cancel_callback:
+                    self._cancel_callback()
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape:
@@ -115,8 +138,13 @@ def start_region_capture(callback, cancel_callback=None):
     全画面をキャプチャしてオーバーレイとして表示し、範囲選択を開始する。
     選択完了後、callbackにQPixmapを渡す。Escキャンセル時はcancel_callbackを呼ぶ。
     """
-    vg = _virtual_geometry()
-    bg = QApplication.primaryScreen().grabWindow(0, vg.x(), vg.y(), vg.width(), vg.height())
+    vg = virtual_geometry()
+    screen = QApplication.primaryScreen()
+    if screen is None:
+        if cancel_callback:
+            cancel_callback()
+        return None
+    bg = screen.grabWindow(0, vg.x(), vg.y(), vg.width(), vg.height())
     selector = RegionSelector(bg, callback, cancel_callback)
     selector.setGeometry(vg)
     selector.show()

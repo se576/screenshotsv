@@ -1,5 +1,6 @@
 """プロファイル管理ダイアログ。"""
 import copy
+from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
@@ -159,12 +160,17 @@ class ProfileDialog(QDialog):
         self._btn_del.setEnabled(can_del)
         self._btn_rename.setEnabled(row >= 0)
 
+    @staticmethod
+    def _truncate_path(path: str, max_len: int = 40) -> str:
+        return path if len(path) <= max_len else "..." + path[-(max_len - 3):]
+
     def _load_profile_to_ui(self, name: str):
+        if name not in self._root.get("profiles", {}):
+            return
         prof = self._root["profiles"][name]
         self._editing = True
         folder = prof.get("save_folder", "")
-        max_len = 40
-        display = folder if len(folder) <= max_len else "..." + folder[-(max_len - 3):]
+        display = self._truncate_path(folder)
         self._lbl_folder.setText(display)
         self._lbl_folder.setToolTip(folder)
 
@@ -239,11 +245,10 @@ class ProfileDialog(QDialog):
     # ------------------------------------------------------------------
 
     def _on_browse_folder(self):
-        current = self._lbl_folder.toolTip() or str(__import__('pathlib').Path.home())
+        current = self._lbl_folder.toolTip() or str(Path.home())
         folder = QFileDialog.getExistingDirectory(self, "保存先フォルダを選択", current)
         if folder:
-            max_len = 40
-            display = folder if len(folder) <= max_len else "..." + folder[-(max_len - 3):]
+            display = self._truncate_path(folder)
             self._lbl_folder.setText(display)
             self._lbl_folder.setToolTip(folder)
             self._save_ui_to_profile()

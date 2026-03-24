@@ -1,7 +1,7 @@
 import copy
 import json
 import logging
-import warnings
+import os
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -70,9 +70,9 @@ def load() -> dict:
             data.setdefault("hotkey_slots", copy.deepcopy(DEFAULT_HOTKEY_SLOTS))
             return data
         except json.JSONDecodeError:
-            warnings.warn(f"設定ファイルが破損しています。デフォルト設定を使用します: {CONFIG_FILE}")
+            logger.warning("設定ファイルが破損しています。デフォルト設定を使用します: %s", CONFIG_FILE)
         except Exception as e:
-            warnings.warn(f"設定ファイルの読み込みに失敗しました: {e}")
+            logger.warning("設定ファイルの読み込みに失敗しました: %s", e)
     return {
         "active_profile": DEFAULT_PROFILE_NAME,
         "profiles": {DEFAULT_PROFILE_NAME: _new_profile()},
@@ -82,13 +82,12 @@ def load() -> dict:
 
 def save(root: dict) -> None:
     """設定を原子的に保存する（書き込み中クラッシュによる破損を防ぐ）。"""
-    import os
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     tmp = CONFIG_DIR / f"config.tmp.{os.getpid()}"
     try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(root, f, ensure_ascii=False, indent=2)
-        os.replace(str(tmp), str(CONFIG_FILE))
+        tmp.replace(CONFIG_FILE)
     except Exception:
         tmp.unlink(missing_ok=True)
         raise
@@ -100,8 +99,15 @@ def save(root: dict) -> None:
 
 def active_profile(root: dict) -> dict:
     """アクティブプロファイルの設定 dict を返す（参照）。"""
-    name = root["active_profile"]
-    return root["profiles"][name]
+    profiles = root.setdefault("profiles", {})
+    name = root.get("active_profile", "")
+    if name not in profiles:
+        # 設定不整合時: 先頭プロファイルにフォールバック
+        name = next(iter(profiles), DEFAULT_PROFILE_NAME)
+        if name not in profiles:
+            profiles[name] = _new_profile()
+        root["active_profile"] = name
+    return profiles[name]
 
 
 def profile_names(root: dict) -> list[str]:

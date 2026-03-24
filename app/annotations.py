@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import TypeAlias
 from PySide6.QtCore import QRect, QPoint
 from PySide6.QtGui import QColor
 
@@ -45,4 +46,4 @@ class TextAnnotation:
         )
 
 
-Annotation = RectAnnotation | FilledRectAnnotation | TextAnnotation
+Annotation: TypeAlias = RectAnnotation | FilledRectAnnotation | TextAnnotation

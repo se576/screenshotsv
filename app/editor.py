@@ -1,8 +1,12 @@
+from collections import deque
+
 from PySide6.QtCore import Qt, QRect, QPoint, QSize, Signal
 from PySide6.QtGui import QPixmap, QPainter, QColor, QPen, QFont, QCursor, QFontMetrics
 from PySide6.QtWidgets import QWidget, QSizePolicy, QInputDialog
 
 from app.annotations import RectAnnotation, FilledRectAnnotation, TextAnnotation, Annotation
+
+_UNDO_LIMIT = 50
 
 def _copy_annotations(annotations: list) -> list:
     """PySide6 オブジェクトを含む Annotation リストを安全にコピーする。"""
@@ -27,8 +31,8 @@ class EditorCanvas(QWidget):
         super().__init__(parent)
         self._pixmap: QPixmap | None = None
         self._annotations: list[Annotation] = []
-        self._undo_stack: list[list[Annotation]] = []
-        self._redo_stack: list[list[Annotation]] = []
+        self._undo_stack: deque = deque(maxlen=_UNDO_LIMIT)
+        self._redo_stack: deque = deque(maxlen=_UNDO_LIMIT)
 
         # スケール済みキャッシュ（paintEvent の二重スケール防止）
         self._scaled_cache: QPixmap | None = None
@@ -335,6 +339,9 @@ class EditorCanvas(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
+        if self._pixmap is None:
+            painter.fillRect(self.rect(), Qt.GlobalColor.darkGray)
+            return
         painter.fillRect(self.rect(), Qt.GlobalColor.darkGray)
 
         scaled = self._get_scaled()
@@ -457,13 +464,16 @@ class EditorCanvas(QWidget):
 
         # --- 選択ツール ---
         if self._active_tool == "select" and self._drag_mode:
-            if self._moved:
-                # undo スタックに push（ドラッグ前の状態）
-                saved_current = _copy_annotations(self._annotations)
-                # orig を元に戻してからpush、その後現在値を再設定
-                self._annotations[self._selected_idx] = self._drag_orig_ann
-                self._push_undo()
-                self._annotations = saved_current
+            if (self._moved
+                    and self._selected_idx is not None
+                    and self._selected_idx < len(self._annotations)):
+                # ドラッグ前の状態を直接構築してundoスタックに積む
+                pre_drag = _copy_annotations(self._annotations)
+                pre_drag[self._selected_idx] = self._drag_orig_ann
+                self._undo_stack.append(pre_drag)
+                self._redo_stack.clear()
+                self.undo_stack_changed.emit(len(self._undo_stack))
+                self.redo_stack_changed.emit(0)
             self._drag_mode = None
             self._drag_start_pos = None
             self._drag_orig_ann = None
@@ -477,6 +487,10 @@ class EditorCanvas(QWidget):
             drag_rect = QRect(self._drag_start, self._drag_end).normalized()
             if drag_rect.width() > 4 and drag_rect.height() > 4:
                 ir = self._image_rect()
+                if ir.isEmpty():
+                    self._drag_start = None
+                    self._drag_end = None
+                    return
                 sx = self._pixmap.width() / ir.width()
                 sy = self._pixmap.height() / ir.height()
                 img_rect = QRect(
@@ -524,6 +538,7 @@ class EditorCanvas(QWidget):
 
     def _push_undo(self):
         self._undo_stack.append(_copy_annotations(self._annotations))
+        # deque(maxlen=_UNDO_LIMIT) が上限超過時に自動で古いエントリを削除する
         self._redo_stack.clear()
         self.undo_stack_changed.emit(len(self._undo_stack))
         self.redo_stack_changed.emit(0)
