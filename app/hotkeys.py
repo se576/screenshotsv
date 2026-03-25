@@ -1,12 +1,13 @@
 """
 グローバルホットキー管理。
-keyboard ライブラリのフックは別スレッドで動くため、
+pynput.keyboard.GlobalHotKeys でフックを設定し、
 コールバックでは queue に積むだけにして Qt メインスレッドで処理する。
-（PySide6 では非 QThread から Signal.emit() を呼ぶとキューイングが不安定になるため）
+（pynput のコールバックは別スレッドで動くため、直接 Signal.emit() はしない）
 """
 import queue
-import keyboard
 import logging
+import re
+from pynput import keyboard as _pynput_kb
 from PySide6.QtCore import QObject, Signal, QTimer
 
 logger = logging.getLogger(__name__)
@@ -21,6 +22,28 @@ ACTIONS = {
 
 _POLL_INTERVAL_MS = 30  # メインスレッドでキューを処理する間隔
 
+# keyboard ライブラリ形式 (ctrl+alt+f) → pynput GlobalHotKeys 形式 (<ctrl>+<alt>+f)
+_SPECIAL_KEYS = frozenset({
+    "ctrl", "alt", "shift", "cmd", "win", "super",
+    "space", "enter", "return", "tab", "esc", "escape", "backspace", "delete",
+    "home", "end", "insert", "pause", "print_screen",
+    "up", "down", "left", "right",
+    "caps_lock", "num_lock", "scroll_lock",
+    "page_up", "page_down",
+})
+
+
+def _to_pynput_combo(combo: str) -> str:
+    """keyboard ライブラリ形式のコンボ文字列を pynput GlobalHotKeys 形式に変換する。"""
+    parts = [p.strip() for p in combo.lower().split("+")]
+    converted = []
+    for part in parts:
+        if part in _SPECIAL_KEYS or re.match(r"^f\d+$", part):
+            converted.append(f"<{part}>")
+        else:
+            converted.append(part)
+    return "+".join(converted)
+
 
 class HotkeyManager(QObject):
     sig_full            = Signal()
@@ -31,8 +54,8 @@ class HotkeyManager(QObject):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._handlers: list = []
-        # keyboard スレッド → Qt メインスレッドへの受け渡しキュー
+        self._listener: _pynput_kb.GlobalHotKeys | None = None
+        # pynput スレッド → Qt メインスレッドへの受け渡しキュー
         self._queue: queue.SimpleQueue = queue.SimpleQueue()
         self._poll_timer = QTimer(self)
         self._poll_timer.setInterval(_POLL_INTERVAL_MS)
@@ -65,8 +88,9 @@ class HotkeyManager(QObject):
     def start(self, slots: list[dict]) -> None:
         """スロットリストからホットキーを登録する。"""
         self.stop()
-        self._poll_timer.start()  # stop() で停止したタイマーを再開する
+        hotkey_map: dict = {}
         seen_combos: set[str] = set()
+
         for slot in slots:
             combo = slot.get("combo", "none")
             if not combo or combo == "none":
@@ -77,27 +101,36 @@ class HotkeyManager(QObject):
             action = slot.get("action", "")
             profile = slot.get("profile", "__active__")
             try:
-                # keyboard スレッドからは queue に積むだけ（スレッドセーフ）
-                handler = keyboard.add_hotkey(
-                    combo,
-                    lambda a=action, p=profile: self._queue.put({"action": a, "profile": p}),
-                    suppress=False,
+                pynput_combo = _to_pynput_combo(combo)
+                # pynput スレッドからは queue に積むだけ（スレッドセーフ）
+                hotkey_map[pynput_combo] = (
+                    lambda a=action, p=profile: self._queue.put({"action": a, "profile": p})
                 )
-                self._handlers.append(handler)
                 seen_combos.add(combo)
-                logger.info("ホットキー登録: combo=%r action=%r profile=%r", combo, action, profile)
+                logger.info("ホットキー登録: combo=%r → %r action=%r profile=%r",
+                            combo, pynput_combo, action, profile)
             except Exception as e:
                 logger.warning("ホットキー登録失敗: combo=%r action=%r: %s", combo, action, e)
 
-    def stop(self) -> None:
-        """登録済みのホットキーをすべて解除する。"""
-        self._poll_timer.stop()
-        for handler in self._handlers:
+        if hotkey_map:
             try:
-                keyboard.remove_hotkey(handler)
+                self._listener = _pynput_kb.GlobalHotKeys(hotkey_map)
+                self._listener.start()
+                self._poll_timer.start()
+                logger.info("ホットキーリスナー起動: %d 件登録", len(hotkey_map))
             except Exception as e:
-                logger.warning("ホットキー解除失敗: handler=%r: %s", handler, e)
-        self._handlers.clear()
+                logger.warning("ホットキーリスナー起動失敗: %s", e)
+                self._listener = None
+
+    def stop(self) -> None:
+        """ホットキーリスナーを停止してキューを空にする。"""
+        self._poll_timer.stop()
+        if self._listener is not None:
+            try:
+                self._listener.stop()
+            except Exception as e:
+                logger.warning("ホットキーリスナー停止失敗: %s", e)
+            self._listener = None
         # キューに残った未処理イベントも捨てる
         while True:
             try:

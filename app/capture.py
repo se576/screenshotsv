@@ -16,13 +16,13 @@ def virtual_geometry() -> QRect:
 
 
 def capture_fullscreen() -> QPixmap:
-    """全画面（全モニター）をキャプチャして返す。スクリーンが取得できない場合は isNull() が True の QPixmap を返す。"""
-    vg = virtual_geometry()
+    """プライマリモニターをキャプチャして返す。スクリーンが取得できない場合は isNull() が True の QPixmap を返す。"""
     screens = QApplication.screens()
     screen = QApplication.primaryScreen() or (screens[0] if screens else None)
     if screen is None:
         return QPixmap()
-    return screen.grabWindow(0, vg.x(), vg.y(), vg.width(), vg.height())
+    geo = screen.geometry()
+    return screen.grabWindow(0, geo.x(), geo.y(), geo.width(), geo.height())
 
 
 class RegionSelector(QWidget):
