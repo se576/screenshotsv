@@ -7,7 +7,8 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QPixmap, QKeySequence, QShortcut, QColor, QPainter, QPen, QIcon
+from PySide6.QtNetwork import QLocalServer
+from PySide6.QtGui import QPixmap, QKeySequence, QShortcut, QColor, QPainter, QPen, QIcon, QActionGroup
 from PySide6.QtWidgets import (
     QMainWindow,
     QWidget,
@@ -25,6 +26,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QMenu,
     QSystemTrayIcon,
+    QCheckBox,
 )
 
 from app import capture, settings
@@ -70,10 +72,15 @@ class MainWindow(QMainWindow):
         self._countdown_remaining: int = 0
         self._countdown_action = None
         self._tray: QSystemTrayIcon | None = None
+        self._startup_action = None
+        self._quitting: bool = False
+        self._ipc_server: QLocalServer | None = None
+        self._capture_started_hidden: bool = False
         self._setup_ui()
         self._setup_shortcuts()
         self._start_hotkeys()
         self._setup_tray()
+        self._setup_ipc()
 
     @property
     def _config(self) -> dict:
@@ -122,6 +129,19 @@ class MainWindow(QMainWindow):
         self._action_folder = settings_menu.addAction("保存先...", self._on_choose_folder)
         settings_menu.addAction("保存設定...", self._on_save_options)
         settings_menu.addAction("ホットキー設定...", self._on_hotkey_settings)
+        self._hotkey_mode_actions = self._add_choice_submenu(
+            settings_menu, "ホットキー撮影後の動作",
+            (("edit", "編集画面に表示する"),
+             ("quicksave", "プロファイルの保存先へ即時保存する")),
+            self._root.get("hotkey_capture_action", settings.DEFAULT_HOTKEY_CAPTURE_ACTION),
+            self._set_hotkey_capture_action)
+        self._close_actions = self._add_choice_submenu(
+            settings_menu, "閉じるボタンの動作",
+            (("ask", "毎回確認する"),
+             ("tray", "バックグラウンドで常駐"),
+             ("quit", "終了する")),
+            self._root.get("close_action", settings.DEFAULT_CLOSE_ACTION),
+            self._set_close_action)
         self._btn_settings.setMenu(settings_menu)
 
         # プロファイル（右端）
@@ -171,12 +191,15 @@ class MainWindow(QMainWindow):
         self._btn_tool_filled_rect.setToolTip("塗りつぶし四角形ツール — ドラッグで描画 (F)")
         self._btn_tool_text = QPushButton("T テキスト")
         self._btn_tool_text.setToolTip("テキストツール — ダブルクリックで文字を入力 (T)")
+        self._btn_tool_crop = QPushButton("✂ トリミング")
+        self._btn_tool_crop.setToolTip("トリミングツール — ドラッグした範囲に切り抜き (C) — Ctrl+Z で元に戻せます")
         self._tool_buttons = {
             None: self._btn_tool_none,
             "select": self._btn_tool_select,
             "rect": self._btn_tool_rect,
             "filled_rect": self._btn_tool_filled_rect,
             "text": self._btn_tool_text,
+            "crop": self._btn_tool_crop,
         }
         for key, btn in self._tool_buttons.items():
             btn.setCheckable(True)
@@ -224,7 +247,7 @@ class MainWindow(QMainWindow):
             return s
 
         for w in (self._btn_tool_none, self._btn_tool_select, self._btn_tool_rect,
-                  self._btn_tool_filled_rect, self._btn_tool_text,
+                  self._btn_tool_filled_rect, self._btn_tool_text, self._btn_tool_crop,
                   _make_sep(), self._btn_color,
                   lbl_width, self._spin_width,
                   lbl_font, self._spin_font_size,
@@ -240,6 +263,7 @@ class MainWindow(QMainWindow):
         self._canvas.set_tool(None)
         self._canvas.undo_stack_changed.connect(self._update_undo_button)
         self._canvas.redo_stack_changed.connect(self._update_redo_button)
+        self._canvas.crop_applied.connect(self._on_crop_applied)
 
         # ========== 中央ウィジェット ==========
         central = QWidget()
@@ -255,6 +279,21 @@ class MainWindow(QMainWindow):
         self._status = QStatusBar()
         self.setStatusBar(self._status)
         self._status.showMessage("F1: 全画面  F2: 範囲選択  F3: ウィンドウ")
+
+    def _add_choice_submenu(self, parent_menu: QMenu, title: str,
+                            options: tuple, current: str, on_change):
+        """排他チェック式のサブメニューを構築し {値: QAction} を返す。"""
+        menu = parent_menu.addMenu(title)
+        group = QActionGroup(self)
+        actions = {}
+        for value, label in options:
+            act = menu.addAction(label)
+            act.setCheckable(True)
+            group.addAction(act)
+            act.setChecked(value == current)
+            act.triggered.connect(lambda checked, v=value: on_change(v))
+            actions[value] = act
+        return actions
 
     def _setup_shortcuts(self):
         QShortcut(QKeySequence("F1"), self, self._on_capture_full)
@@ -272,6 +311,7 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("R"), self, lambda: self._on_select_tool("rect"))
         QShortcut(QKeySequence("F"), self, lambda: self._on_select_tool("filled_rect"))
         QShortcut(QKeySequence("T"), self, lambda: self._on_select_tool("text"))
+        QShortcut(QKeySequence("C"), self, lambda: self._on_select_tool("crop"))
 
     # ------------------------------------------------------------------
     # キャプチャ
@@ -289,10 +329,7 @@ class MainWindow(QMainWindow):
             return
 
         # 前回のカウントダウンが残っていれば停止
-        if self._countdown_timer is not None:
-            self._countdown_timer.stop()
-            self._countdown_timer.deleteLater()
-            self._countdown_timer = None
+        self._stop_countdown()
 
         self._countdown_remaining = secs
         self._countdown_action = action
@@ -301,42 +338,67 @@ class MainWindow(QMainWindow):
         self._countdown_timer.start(1000)
         self._status.showMessage(f"キャプチャまで {self._countdown_remaining} 秒...")
 
+    def _stop_countdown(self):
+        """実行中のカウントダウンタイマーを停止・破棄する。"""
+        if self._countdown_timer is not None:
+            self._countdown_timer.stop()
+            self._countdown_timer.deleteLater()
+            self._countdown_timer = None
+        self._countdown_action = None
+
+    def _cancel_countdown(self):
+        """遅延キャプチャをユーザー操作として中止し、UIを操作可能な状態に戻す。"""
+        if self._countdown_timer is None:
+            return
+        self._stop_countdown()
+        self._set_capture_buttons_enabled(True)
+        self._status.showMessage("キャプチャを中止しました")
+
     def _tick_countdown(self):
         self._countdown_remaining -= 1
         if self._countdown_remaining > 0:
             self._status.showMessage(f"キャプチャまで {self._countdown_remaining} 秒...")
         else:
-            self._countdown_timer.stop()
-            self._countdown_timer = None
-            self._countdown_action()
+            action = self._countdown_action
+            self._stop_countdown()
+            action()
 
     def _set_capture_buttons_enabled(self, enabled: bool):
         for btn in (self._btn_full, self._btn_region, self._btn_window):
             btn.setEnabled(enabled)
 
-    def _on_capture_full(self):
+    def _begin_capture_ui(self):
+        """キャプチャ開始時のウィンドウ退避。トレイ格納中（非表示）なら状態を変えない。"""
+        self._capture_started_hidden = self.isHidden()
         self._set_capture_buttons_enabled(False)
-        if not self.isMinimized():
+        if not self._capture_started_hidden and not self.isMinimized():
             self.showMinimized()
+
+    def _restore_window_after_capture(self):
+        """キャプチャ開始時に表示されていた場合のみウィンドウを復元する。
+        キャンセル・失敗・即時保存モードでは、トレイ格納中なら隠れたままにする。"""
+        if self._capture_started_hidden:
+            return
+        self.showNormal()
+        self.activateWindow()
+
+    def _on_capture_full(self):
+        self._begin_capture_ui()
         self._start_countdown(self._do_capture_full)
 
     def _do_capture_full(self):
         pixmap = capture.capture_fullscreen()
         self._set_capture_buttons_enabled(True)
-        self.showNormal()
-        self.activateWindow()
+        # 編集画面に表示するため、トレイ格納中でもウィンドウを前面に出す
+        self._show_window()
         self._set_pixmap(pixmap)
 
     def _on_capture_region(self):
-        self._set_capture_buttons_enabled(False)
-        if not self.isMinimized():
-            self.showMinimized()
+        self._begin_capture_ui()
         self._start_countdown(self._do_start_region)
 
     def _on_capture_window(self):
-        self._set_capture_buttons_enabled(False)
-        if not self.isMinimized():
-            self.showMinimized()
+        self._begin_capture_ui()
         self._start_countdown(self._do_start_window)
 
     def _do_start_window(self):
@@ -355,23 +417,22 @@ class MainWindow(QMainWindow):
 
     def _on_region_captured(self, pixmap: QPixmap):
         self._set_capture_buttons_enabled(True)
-        self.showNormal()
-        self.activateWindow()
+        # 編集画面に表示するため、トレイ格納中でもウィンドウを前面に出す
+        self._show_window()
         self._set_pixmap(pixmap)
 
     def _on_capture_cancelled(self):
         """範囲選択 / ウィンドウ選択がEscでキャンセルされたときにメインウィンドウを復元する。"""
         self._set_capture_buttons_enabled(True)
-        self.showNormal()
-        self.activateWindow()
+        self._restore_window_after_capture()
         self._status.showMessage("キャプチャをキャンセルしました")
 
     def _set_pixmap(self, pixmap: QPixmap):
         self._set_capture_buttons_enabled(True)
         if pixmap is None or pixmap.isNull():
-            self.showNormal()
-            self.activateWindow()
+            self._restore_window_after_capture()
             self._status.showMessage("キャプチャに失敗しました")
+            self._show_toast("キャプチャに失敗しました")
             return
         self._canvas.set_pixmap(pixmap)
         for btn in (self._btn_copy, self._btn_save, self._btn_quicksave):
@@ -410,11 +471,17 @@ class MainWindow(QMainWindow):
         for key, btn in self._tool_buttons.items():
             btn.setChecked(key == tool)
         self._canvas.set_tool(tool)
-        names = {None: "なし", "select": "選択", "rect": "矩形", "filled_rect": "四角形（塗りつぶし）", "text": "テキスト"}
+        names = {None: "なし", "select": "選択", "rect": "矩形", "filled_rect": "四角形（塗りつぶし）",
+                 "text": "テキスト", "crop": "トリミング"}
         if tool == "select":
             self._status.showMessage("選択ツール: クリックで選択 / ドラッグで移動 / 角をドラッグでリサイズ / Del で削除")
+        elif tool == "crop":
+            self._status.showMessage("トリミングツール: ドラッグした範囲に切り抜きます（Ctrl+Z で元に戻せます）")
         else:
             self._status.showMessage(f"ツール: {names.get(tool, tool)}")
+
+    def _on_crop_applied(self, width: int, height: int):
+        self._status.showMessage(f"トリミングしました: {width} x {height} px（Ctrl+Z で元に戻せます）")
 
     def _on_pick_color(self):
         initial = (self._canvas.get_selected_color()
@@ -482,7 +549,12 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _show_toast(self, message: str, duration_ms: int = 2500):
-        """ウィンドウ下部中央に短時間表示するトースト通知。"""
+        """ウィンドウ下部中央に短時間表示するトースト通知。
+        ウィンドウ非表示中（トレイ格納中）はトレイ通知にフォールバックする。"""
+        if self.isHidden() and self._tray is not None:
+            self._tray.showMessage("スクリーンショット", message,
+                                   QSystemTrayIcon.MessageIcon.Information, duration_ms)
+            return
         toast = QLabel(message, self)
         toast.setStyleSheet(
             "background: rgba(30,30,30,210); color: white;"
@@ -622,14 +694,36 @@ class MainWindow(QMainWindow):
         self._hotkey_manager.start(self._root.get("hotkey_slots", []))
 
     def _on_capture_with_profile(self, action: str, profile_name: str):
-        """指定プロファイルの設定でキャプチャ＋即時保存する。アクティブプロファイルは変わらない。"""
+        """プロファイル指定ホットキーの処理。アクティブプロファイルは変わらない。
+        撮影系は「ホットキー撮影後の動作」設定に従い、編集画面表示または即時保存する。"""
         profiles = self._root.get("profiles", {})
         if profile_name not in profiles:
             return
         # deepcopy でスナップショットを取る: 300ms 待機中にプロファイル設定が変更されても影響を受けない
         prof = copy.deepcopy(profiles[profile_name])
 
-        self.showMinimized()
+        # save: 編集中の画像（注釈込み）をそのプロファイルの保存先へ保存する
+        if action == "save":
+            pixmap = self._canvas.get_pixmap()
+            if pixmap is not None:
+                # 元画像のバックアップはキャプチャ時に済んでいるため backup=False
+                self._quicksave_with_profile(pixmap, prof, backup=False)
+            return
+
+        mode = self._root.get("hotkey_capture_action", settings.DEFAULT_HOTKEY_CAPTURE_ACTION)
+        if mode == "edit":
+            # 編集画面に表示: 通常のキャプチャフローに乗せる（完了時にウィンドウが前面に出る）
+            handler = {"full": self._on_capture_full,
+                       "region": self._on_capture_region,
+                       "window": self._on_capture_window}.get(action)
+            if handler:
+                handler()
+            return
+
+        # 即時保存（従来動作）
+        self._capture_started_hidden = self.isHidden()
+        if not self._capture_started_hidden:
+            self.showMinimized()
         if action == "full":
             QTimer.singleShot(300, lambda: self._do_capture_full_with_profile(prof))
         elif action == "region":
@@ -651,16 +745,14 @@ class MainWindow(QMainWindow):
 
     def _do_capture_full_with_profile(self, prof: dict):
         pixmap = capture.capture_fullscreen()
-        self.showNormal()
-        self.activateWindow()
+        self._restore_window_after_capture()
         self._quicksave_with_profile(pixmap, prof)
 
     def _on_captured_with_profile(self, pixmap: QPixmap, prof: dict):
-        self.showNormal()
-        self.activateWindow()
+        self._restore_window_after_capture()
         self._quicksave_with_profile(pixmap, prof)
 
-    def _quicksave_with_profile(self, pixmap: QPixmap, prof: dict):
+    def _quicksave_with_profile(self, pixmap: QPixmap, prof: dict, backup: bool = True):
         """指定プロファイルの設定で即時保存する。"""
         if pixmap is None or pixmap.isNull():
             return
@@ -668,7 +760,7 @@ class MainWindow(QMainWindow):
         save_folder = prof.get("save_folder", _default_folder)
 
         # バックアップ
-        if prof.get("auto_backup_enabled", True):
+        if backup and prof.get("auto_backup_enabled", True):
             backup_dir = Path(save_folder) / "backup"
             try:
                 backup_dir.mkdir(parents=True, exist_ok=True)
@@ -808,10 +900,37 @@ class MainWindow(QMainWindow):
             self._show_window()
 
     def _show_window(self):
-        """ウィンドウを前面に表示する。"""
+        """ウィンドウを前面に表示する。遅延キャプチャ中なら中止する。"""
+        self._cancel_countdown()
         self.showNormal()
         self.activateWindow()
         self.raise_()
+
+    # ------------------------------------------------------------------
+    # 多重起動通知（2つ目のインスタンスからの「ウィンドウを開く」要求）
+    # ------------------------------------------------------------------
+
+    def _setup_ipc(self):
+        """2つ目のインスタンスからの接続を受け付けるローカルサーバーを起動する。"""
+        # クラッシュ後に残った古いソケットを掃除してから listen する
+        QLocalServer.removeServer(settings.IPC_SERVER_NAME)
+        self._ipc_server = QLocalServer(self)
+        if not self._ipc_server.listen(settings.IPC_SERVER_NAME):
+            logger.warning("多重起動通知サーバーの起動に失敗しました: %s",
+                           self._ipc_server.errorString())
+            self._ipc_server = None
+            return
+        self._ipc_server.newConnection.connect(self._on_ipc_connection)
+
+    def _on_ipc_connection(self):
+        """接続があればウィンドウを前面表示する（接続自体が表示要求）。"""
+        while True:
+            conn = self._ipc_server.nextPendingConnection()
+            if conn is None:
+                break
+            conn.disconnected.connect(conn.deleteLater)
+            conn.close()
+        self._show_window()
 
     # ------------------------------------------------------------------
     # スタートアップ登録（タスクスケジューラ経由・管理者権限で自動起動）
@@ -887,10 +1006,9 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "エラー", f"スタートアップからの削除に失敗しました:\n{e}")
 
     def _quit_app(self):
-        """トレイメニューの「終了」から完全に終了する。"""
-        if self._countdown_timer is not None:
-            self._countdown_timer.stop()
-            self._countdown_timer = None
+        """トレイメニューの「終了」または×ボタン（終了選択時）から完全に終了する。"""
+        self._quitting = True
+        self._stop_countdown()
         self._hotkey_manager.stop()
         self._release_selector()
         QApplication.quit()
@@ -899,25 +1017,83 @@ class MainWindow(QMainWindow):
     # ウィンドウ終了
     # ------------------------------------------------------------------
 
-    def closeEvent(self, event):
-        """×ボタンはトレイに格納する。トレイが使えない場合は終了する。"""
-        if self._tray is not None and self._tray.isVisible():
-            event.ignore()
-            if self._countdown_timer is not None:
-                self._countdown_timer.stop()
-                self._countdown_timer = None
-            self.hide()
-            self._tray.showMessage(
-                "スクリーンショット",
-                "バックグラウンドで動作しています。\nホットキーは引き続き有効です。",
-                QSystemTrayIcon.MessageIcon.Information,
-                2500,
-            )
+    def _set_hotkey_capture_action(self, value: str):
+        """ホットキー撮影後の動作設定を保存し、メニューのチェック状態を同期する。"""
+        self._root["hotkey_capture_action"] = value
+        self._save_settings()
+        for v, act in self._hotkey_mode_actions.items():
+            act.setChecked(v == value)
+
+    def _set_close_action(self, value: str):
+        """×ボタンの動作設定を保存し、メニューのチェック状態を同期する。"""
+        self._root["close_action"] = value
+        self._save_settings()
+        self._sync_close_action_menu()
+
+    def _sync_close_action_menu(self):
+        current = self._root.get("close_action", settings.DEFAULT_CLOSE_ACTION)
+        for value, act in self._close_actions.items():
+            act.setChecked(value == current)
+
+    def _ask_close_action(self) -> str | None:
+        """×ボタン時の動作を確認する。"tray" / "quit" / None（キャンセル）を返す。"""
+        box = QMessageBox(self)
+        box.setWindowTitle("スクリーンショット")
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText("ウィンドウを閉じます。動作を選択してください。")
+        box.setInformativeText("バックグラウンドで常駐すると、グローバルホットキーを引き続き使用できます。")
+        btn_tray = box.addButton("バックグラウンドで常駐", QMessageBox.ButtonRole.AcceptRole)
+        btn_quit = box.addButton("終了する", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(btn_tray)
+        remember = QCheckBox("この選択を記憶する（⚙設定メニューから変更できます）")
+        box.setCheckBox(remember)
+        box.exec()
+        # 親付きで手動生成したダイアログは明示的に破棄する（親が生きている限り解放されない）
+        box.deleteLater()
+
+        clicked = box.clickedButton()
+        if clicked is btn_tray:
+            choice = "tray"
+        elif clicked is btn_quit:
+            choice = "quit"
         else:
-            # トレイが使えない環境、またはトレイが非表示になった場合は終了する
-            if self._countdown_timer is not None:
-                self._countdown_timer.stop()
-                self._countdown_timer = None
+            return None
+        if remember.isChecked():
+            self._set_close_action(choice)
+        return choice
+
+    def _hide_to_tray(self):
+        """ウィンドウをトレイに格納する。遅延キャプチャ中なら中止する。"""
+        self._cancel_countdown()
+        self.hide()
+        self._tray.showMessage(
+            "スクリーンショット",
+            "バックグラウンドで動作しています。\nホットキーは引き続き有効です。",
+            QSystemTrayIcon.MessageIcon.Information,
+            2500,
+        )
+
+    def closeEvent(self, event):
+        """×ボタン: 設定に応じてトレイ常駐・終了・毎回確認を切り替える。"""
+        tray_available = self._tray is not None and self._tray.isVisible()
+        if self._quitting or not tray_available:
+            # トレイが使えない環境、または「終了」経由ではそのまま終了する
+            self._stop_countdown()
             self._hotkey_manager.stop()
             self._release_selector()
             super().closeEvent(event)
+            return
+
+        action = self._root.get("close_action", settings.DEFAULT_CLOSE_ACTION)
+        if action == "ask":
+            action = self._ask_close_action()
+
+        # ウィンドウ破棄は _quit_app() の QApplication.quit() に委ねるため、
+        # どの分岐でもイベント自体は受理しない
+        event.ignore()
+        if action == "quit":
+            self._quit_app()
+        elif action == "tray":
+            self._hide_to_tray()
+        # None（キャンセル）は何もしない

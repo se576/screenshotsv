@@ -24,6 +24,19 @@ DEFAULT_HOTKEY_SLOTS = [
     {"action": "save",   "combo": "none",         "profile": "__active__"},
 ]
 
+# ×ボタンの動作（ルートに保存）: "ask"=毎回確認 / "tray"=トレイ常駐 / "quit"=終了
+DEFAULT_CLOSE_ACTION = "ask"
+CLOSE_ACTIONS = ("ask", "tray", "quit")
+
+# プロファイル指定ホットキーで撮影したときの動作（ルートに保存）:
+# "edit"=編集画面に表示 / "quicksave"=プロファイルの保存先へ即時保存（従来動作）
+DEFAULT_HOTKEY_CAPTURE_ACTION = "edit"
+HOTKEY_CAPTURE_ACTIONS = ("edit", "quicksave")
+
+# 多重起動防止用のアプリ識別子（エントリポイントとメインウィンドウで共有）
+SINGLE_INSTANCE_MUTEX_NAME = "screenshotsv_single_instance"
+IPC_SERVER_NAME = "screenshotsv_ipc"
+
 PROFILE_DEFAULTS = {
     "save_folder": str(Path.home() / "Pictures"),
     "save_format": "png",
@@ -68,6 +81,12 @@ def load() -> dict:
                     prof.setdefault(k, v)
             # グローバルホットキースロットを補完
             data.setdefault("hotkey_slots", copy.deepcopy(DEFAULT_HOTKEY_SLOTS))
+            # ×ボタンの動作を補完（不正値はデフォルトに戻す）
+            if data.get("close_action") not in CLOSE_ACTIONS:
+                data["close_action"] = DEFAULT_CLOSE_ACTION
+            # ホットキー撮影後の動作を補完（不正値はデフォルトに戻す）
+            if data.get("hotkey_capture_action") not in HOTKEY_CAPTURE_ACTIONS:
+                data["hotkey_capture_action"] = DEFAULT_HOTKEY_CAPTURE_ACTION
             return data
         except json.JSONDecodeError:
             logger.warning("設定ファイルが破損しています。デフォルト設定を使用します: %s", CONFIG_FILE)
@@ -77,6 +96,8 @@ def load() -> dict:
         "active_profile": DEFAULT_PROFILE_NAME,
         "profiles": {DEFAULT_PROFILE_NAME: _new_profile()},
         "hotkey_slots": copy.deepcopy(DEFAULT_HOTKEY_SLOTS),
+        "close_action": DEFAULT_CLOSE_ACTION,
+        "hotkey_capture_action": DEFAULT_HOTKEY_CAPTURE_ACTION,
     }
 
 

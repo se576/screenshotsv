@@ -7,6 +7,7 @@ pynput.keyboard.GlobalHotKeys でフックを設定し、
 import queue
 import logging
 import re
+import time
 from pynput import keyboard as _pynput_kb
 from PySide6.QtCore import QObject, Signal, QTimer
 
@@ -21,6 +22,7 @@ ACTIONS = {
 }
 
 _POLL_INTERVAL_MS = 30  # メインスレッドでキューを処理する間隔
+_DEBOUNCE_SEC = 0.4  # 同一ホットキーの連打・多重発火を無視する間隔
 
 # keyboard ライブラリ形式 (ctrl+alt+f) → pynput GlobalHotKeys 形式 (<ctrl>+<alt>+f)
 _SPECIAL_KEYS = frozenset({
@@ -57,6 +59,8 @@ class HotkeyManager(QObject):
         self._listener: _pynput_kb.GlobalHotKeys | None = None
         # pynput スレッド → Qt メインスレッドへの受け渡しキュー
         self._queue: queue.SimpleQueue = queue.SimpleQueue()
+        # (action, profile) → 最終発火時刻。連打によるキャプチャ・保存の多重実行を防ぐ
+        self._last_fired: dict[tuple[str, str], float] = {}
         self._poll_timer = QTimer(self)
         self._poll_timer.setInterval(_POLL_INTERVAL_MS)
         self._poll_timer.timeout.connect(self._flush_queue)
@@ -74,6 +78,11 @@ class HotkeyManager(QObject):
                 item = self._queue.get_nowait()
                 action: str = item["action"]
                 profile: str = item["profile"]
+                now = time.monotonic()
+                if now - self._last_fired.get((action, profile), 0.0) < _DEBOUNCE_SEC:
+                    logger.debug("ホットキー連打を無視: action=%r profile=%r", action, profile)
+                    continue
+                self._last_fired[(action, profile)] = now
                 if profile == "__active__":
                     sig = sig_map.get(action)
                     if sig:

@@ -21,11 +21,16 @@ _HANDLES = ("tl", "tr", "bl", "br")  # top-left, top-right, bottom-left, bottom-
 class EditorCanvas(QWidget):
     """
     スクリーンショット表示 + アノテーション描画キャンバス。
-    ツール: "select" | "rect" | "filled_rect" | "text" | None
+    ツール: "select" | "rect" | "filled_rect" | "text" | "crop" | None
+
+    Undo/Redo スタックの各エントリは (pixmap, annotations) のタプル。
+    QPixmap は暗黙共有のため参照保持のコストはほぼゼロで、
+    トリミングで画像自体が変わる操作も同じスタックで巻き戻せる。
     """
 
     undo_stack_changed = Signal(int)  # Undoスタックのサイズを emit
     redo_stack_changed = Signal(int)  # Redoスタックのサイズを emit
+    crop_applied = Signal(int, int)   # トリミング後の画像サイズ (width, height) を emit
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -108,11 +113,24 @@ class EditorCanvas(QWidget):
     def set_font_size(self, size: int) -> None:
         self._font_size = size
 
+    def _snapshot(self) -> tuple:
+        """現在の編集状態（画像 + 注釈）のスナップショットを返す。"""
+        return (self._pixmap, _copy_annotations(self._annotations))
+
+    def _restore(self, snap: tuple) -> None:
+        """スナップショットから編集状態を復元する。"""
+        pixmap, annotations = snap
+        if pixmap is not self._pixmap:
+            self._pixmap = pixmap
+            self._scaled_cache = None
+            self._scaled_cache_size = None
+        self._annotations = annotations
+
     def undo(self) -> bool:
         if not self._undo_stack:
             return False
-        self._redo_stack.append(_copy_annotations(self._annotations))
-        self._annotations = self._undo_stack.pop()
+        self._redo_stack.append(self._snapshot())
+        self._restore(self._undo_stack.pop())
         self._selected_idx = None
         self.undo_stack_changed.emit(len(self._undo_stack))
         self.redo_stack_changed.emit(len(self._redo_stack))
@@ -122,8 +140,8 @@ class EditorCanvas(QWidget):
     def redo(self) -> bool:
         if not self._redo_stack:
             return False
-        self._undo_stack.append(_copy_annotations(self._annotations))
-        self._annotations = self._redo_stack.pop()
+        self._undo_stack.append(self._snapshot())
+        self._restore(self._redo_stack.pop())
         self._selected_idx = None
         self.undo_stack_changed.emit(len(self._undo_stack))
         self.redo_stack_changed.emit(len(self._redo_stack))
@@ -220,6 +238,44 @@ class EditorCanvas(QWidget):
         sx = self._pixmap.width() / ir.width()
         sy = self._pixmap.height() / ir.height()
         return QPoint(int(delta.x() * sx), int(delta.y() * sy))
+
+    def _canvas_rect_to_image(self, canvas_rect: QRect) -> QRect | None:
+        """キャンバス座標の矩形を画像座標に変換する。画像未表示なら None。"""
+        ir = self._image_rect()
+        if not self._pixmap or ir.isEmpty():
+            return None
+        sx = self._pixmap.width() / ir.width()
+        sy = self._pixmap.height() / ir.height()
+        return QRect(
+            int((canvas_rect.x() - ir.x()) * sx),
+            int((canvas_rect.y() - ir.y()) * sy),
+            int(canvas_rect.width() * sx),
+            int(canvas_rect.height() * sy),
+        )
+
+    # ------------------------------------------------------------------
+    # 内部: トリミング
+    # ------------------------------------------------------------------
+
+    def _apply_crop(self, img_rect: QRect) -> None:
+        """画像を img_rect（画像座標）で切り抜き、注釈を新しい原点に合わせて移動する。"""
+        rect = img_rect.normalized().intersected(self._pixmap.rect())
+        if rect.width() < 2 or rect.height() < 2:
+            return
+        if rect == self._pixmap.rect():
+            return  # 全体選択は何もしない
+        self._push_undo()
+        self._pixmap = self._pixmap.copy(rect)
+        for ann in self._annotations:
+            if isinstance(ann, (RectAnnotation, FilledRectAnnotation)):
+                ann.rect.translate(-rect.x(), -rect.y())
+            elif isinstance(ann, TextAnnotation):
+                ann.pos = QPoint(ann.pos.x() - rect.x(), ann.pos.y() - rect.y())
+        self._selected_idx = None
+        self._scaled_cache = None
+        self._scaled_cache_size = None
+        self.update()
+        self.crop_applied.emit(rect.width(), rect.height())
 
     # ------------------------------------------------------------------
     # 内部: ヒットテスト / ハンドル
@@ -376,6 +432,37 @@ class EditorCanvas(QWidget):
                 painter.setBrush(self._color)
             painter.drawRect(preview_rect)
 
+        # ドラッグ中プレビュー（トリミング: 範囲外を暗転 + 破線枠 + サイズ表示）
+        if self._drag_start and self._drag_end and self._active_tool == "crop":
+            self._draw_crop_preview(painter)
+
+    def _draw_crop_preview(self, painter: QPainter):
+        sel = QRect(self._drag_start, self._drag_end).normalized()
+        full = self.rect()
+        overlay = QColor(0, 0, 0, 120)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(overlay)
+        painter.drawRect(QRect(full.left(), full.top(), full.width(), sel.top() - full.top()))
+        painter.drawRect(QRect(full.left(), sel.bottom() + 1,
+                               full.width(), full.bottom() - sel.bottom()))
+        painter.drawRect(QRect(full.left(), sel.top(), sel.left() - full.left(), sel.height()))
+        painter.drawRect(QRect(sel.right() + 1, sel.top(),
+                               full.right() - sel.right(), sel.height()))
+
+        pen = QPen(QColor(0, 160, 255), 2, Qt.PenStyle.DashLine)
+        pen.setCosmetic(True)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRect(sel)
+
+        # 画像座標でのサイズを選択枠の上に表示
+        img_rect = self._canvas_rect_to_image(sel)
+        if img_rect is not None:
+            clamped = img_rect.intersected(self._pixmap.rect())
+            label = f"{clamped.width()} x {clamped.height()} px"
+            painter.setPen(QColor(255, 255, 255))
+            painter.drawText(sel.left() + 4, max(sel.top() - 6, 12), label)
+
     # ------------------------------------------------------------------
     # マウスイベント
     # ------------------------------------------------------------------
@@ -413,7 +500,7 @@ class EditorCanvas(QWidget):
         if self._active_tool is None:
             return
 
-        if self._active_tool in ("rect", "filled_rect"):
+        if self._active_tool in ("rect", "filled_rect", "crop"):
             self._drag_start = pos
             self._drag_end = pos
         # text ツールはダブルクリックで入力（mouseDoubleClickEvent 参照）
@@ -453,8 +540,8 @@ class EditorCanvas(QWidget):
             self.update()
             return
 
-        # --- 描画ツール: ドラッグ ---
-        if self._active_tool in ("rect", "filled_rect") and self._drag_start:
+        # --- 描画ツール / トリミング: ドラッグ ---
+        if self._active_tool in ("rect", "filled_rect", "crop") and self._drag_start:
             self._drag_end = pos
             self.update()
 
@@ -470,7 +557,7 @@ class EditorCanvas(QWidget):
                 # ドラッグ前の状態を直接構築してundoスタックに積む
                 pre_drag = _copy_annotations(self._annotations)
                 pre_drag[self._selected_idx] = self._drag_orig_ann
-                self._undo_stack.append(pre_drag)
+                self._undo_stack.append((self._pixmap, pre_drag))
                 self._redo_stack.clear()
                 self.undo_stack_changed.emit(len(self._undo_stack))
                 self.redo_stack_changed.emit(0)
@@ -481,24 +568,28 @@ class EditorCanvas(QWidget):
             self.update()
             return
 
+        # --- トリミングツール ---
+        if self._active_tool == "crop" and self._drag_start:
+            drag_rect = QRect(self._drag_start, event.position().toPoint()).normalized()
+            self._drag_start = None
+            self._drag_end = None
+            if drag_rect.width() > 4 and drag_rect.height() > 4:
+                img_rect = self._canvas_rect_to_image(drag_rect)
+                if img_rect is not None:
+                    self._apply_crop(img_rect)
+            self.update()
+            return
+
         # --- 描画ツール ---
         if self._active_tool in ("rect", "filled_rect") and self._drag_start:
             self._drag_end = event.position().toPoint()
             drag_rect = QRect(self._drag_start, self._drag_end).normalized()
             if drag_rect.width() > 4 and drag_rect.height() > 4:
-                ir = self._image_rect()
-                if ir.isEmpty():
+                img_rect = self._canvas_rect_to_image(drag_rect)
+                if img_rect is None:
                     self._drag_start = None
                     self._drag_end = None
                     return
-                sx = self._pixmap.width() / ir.width()
-                sy = self._pixmap.height() / ir.height()
-                img_rect = QRect(
-                    int((drag_rect.x() - ir.x()) * sx),
-                    int((drag_rect.y() - ir.y()) * sy),
-                    int(drag_rect.width() * sx),
-                    int(drag_rect.height() * sy),
-                )
                 self._push_undo()
                 if self._active_tool == "rect":
                     self._annotations.append(
@@ -537,7 +628,7 @@ class EditorCanvas(QWidget):
     # ------------------------------------------------------------------
 
     def _push_undo(self):
-        self._undo_stack.append(_copy_annotations(self._annotations))
+        self._undo_stack.append(self._snapshot())
         # deque(maxlen=_UNDO_LIMIT) が上限超過時に自動で古いエントリを削除する
         self._redo_stack.clear()
         self.undo_stack_changed.emit(len(self._undo_stack))
