@@ -48,7 +48,10 @@ def _apply_border_effect(pixmap: QPixmap, prof: dict) -> QPixmap:
         return pixmap
     result = pixmap.copy()
     painter = QPainter(result)
-    w = float(prof.get("auto_border_width", 4))
+    # 枠幅は短辺の半分でクランプする。ペンは輪郭の両側に w/2 ずつ広がるため、
+    # これを超えると矩形が負寸法になる（半分ちょうどで画像全面が枠色になる）
+    w = min(float(prof.get("auto_border_width", 4)),
+            pixmap.width() / 2, pixmap.height() / 2)
     color = QColor(prof.get("auto_border_color", "#ff0000"))
     pen = QPen(color, w)
     pen.setJoinStyle(Qt.PenJoinStyle.MiterJoin)
@@ -394,8 +397,6 @@ class MainWindow(QMainWindow):
     def _do_capture_full(self):
         pixmap = capture.capture_fullscreen()
         self._set_capture_buttons_enabled(True)
-        # 編集画面に表示するため、トレイ格納中でもウィンドウを前面に出す
-        self._show_window()
         self._set_pixmap(pixmap)
 
     def _on_capture_region(self):
@@ -422,8 +423,6 @@ class MainWindow(QMainWindow):
 
     def _on_region_captured(self, pixmap: QPixmap):
         self._set_capture_buttons_enabled(True)
-        # 編集画面に表示するため、トレイ格納中でもウィンドウを前面に出す
-        self._show_window()
         self._set_pixmap(pixmap)
 
     def _on_capture_cancelled(self):
@@ -435,10 +434,13 @@ class MainWindow(QMainWindow):
     def _set_pixmap(self, pixmap: QPixmap):
         self._set_capture_buttons_enabled(True)
         if pixmap is None or pixmap.isNull():
+            # 失敗時はトレイ格納中なら隠れたまま、トースト（非表示中はトレイ通知）で知らせる
             self._restore_window_after_capture()
             self._status.showMessage("キャプチャに失敗しました")
             self._show_toast("キャプチャに失敗しました")
             return
+        # 編集画面に表示するため、トレイ格納中でもウィンドウを前面に出す（検証後のみ）
+        self._show_window()
         self._canvas.set_pixmap(pixmap)
         for btn in (self._btn_copy, self._btn_save, self._btn_quicksave):
             btn.setEnabled(True)
@@ -726,7 +728,10 @@ class MainWindow(QMainWindow):
 
         mode = self._root.get("hotkey_capture_action", settings.DEFAULT_HOTKEY_CAPTURE_ACTION)
         if mode == "edit":
-            # 編集画面に表示: 通常のキャプチャフローに乗せる（完了時にウィンドウが前面に出る）
+            # 編集画面に表示: 指定プロファイルへ切り替えてから通常のキャプチャフローに乗せる。
+            # 切り替えはコンボボックスにも反映され、その後の保存・エフェクトが指定プロファイルで動く
+            if profile_name != self._root.get("active_profile"):
+                self._combo_profile.setCurrentText(profile_name)
             handler = {"full": self._on_capture_full,
                        "region": self._on_capture_region,
                        "window": self._on_capture_window}.get(action)
@@ -791,7 +796,9 @@ class MainWindow(QMainWindow):
         if result.save(str(path), "PNG"):
             self._notify_saved(path, prof, status_text=f"保存しました [{folder}]: {path.name}")
         else:
+            # トレイ格納中は _show_toast がトレイ通知にフォールバックする（無通知の保存失敗を防ぐ）
             self._status.showMessage(f"保存に失敗しました: {path}")
+            self._show_toast(f"保存に失敗しました: {path.name}")
 
     def _on_hotkey_settings(self):
         self._hotkey_manager.stop()
