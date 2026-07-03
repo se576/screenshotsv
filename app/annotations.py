@@ -8,7 +8,7 @@ from PySide6.QtGui import QColor
 class RectAnnotation:
     rect: QRect
     color: QColor
-    line_width: int
+    line_width: float
 
     def copy(self) -> "RectAnnotation":
         return RectAnnotation(

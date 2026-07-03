@@ -44,7 +44,7 @@ PROFILE_DEFAULTS = {
     "open_folder_after_save": False,
     "auto_border_enabled": False,
     "auto_border_color": "#ff0000",
-    "auto_border_width": 4,
+    "auto_border_width": 4.0,  # 0.1px 単位（旧設定の int 値もそのまま読める）
 }
 
 

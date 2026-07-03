@@ -6,7 +6,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QRectF
 from PySide6.QtNetwork import QLocalServer
 from PySide6.QtGui import QPixmap, QKeySequence, QShortcut, QColor, QPainter, QPen, QIcon, QActionGroup
 from PySide6.QtWidgets import (
@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QStatusBar,
     QApplication,
     QSpinBox,
+    QDoubleSpinBox,
     QColorDialog,
     QFrame,
     QComboBox,
@@ -47,14 +48,16 @@ def _apply_border_effect(pixmap: QPixmap, prof: dict) -> QPixmap:
         return pixmap
     result = pixmap.copy()
     painter = QPainter(result)
-    w = prof.get("auto_border_width", 4)
+    w = float(prof.get("auto_border_width", 4))
     color = QColor(prof.get("auto_border_color", "#ff0000"))
     pen = QPen(color, w)
     pen.setJoinStyle(Qt.PenJoinStyle.MiterJoin)
+    # 0.1px 単位の幅を正しく表現する（整数丸めを防ぐ）
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
     painter.setPen(pen)
     painter.setBrush(Qt.BrushStyle.NoBrush)
-    offset = w // 2
-    painter.drawRect(offset, offset, result.width() - w, result.height() - w)
+    offset = w / 2
+    painter.drawRect(QRectF(offset, offset, result.width() - w, result.height() - w))
     painter.end()
     return result
 
@@ -211,13 +214,15 @@ class MainWindow(QMainWindow):
         self._btn_color.setToolTip("描画色を選択（選択中のオブジェクトがあれば色を変更）")
         self._btn_color.clicked.connect(self._on_pick_color)
 
-        # 線幅
+        # 線幅（0.1px 単位）
         lbl_width = QLabel("線幅:")
-        self._spin_width = QSpinBox()
-        self._spin_width.setRange(1, 20)
-        self._spin_width.setValue(2)
+        self._spin_width = QDoubleSpinBox()
+        self._spin_width.setRange(0.1, 20.0)
+        self._spin_width.setDecimals(1)
+        self._spin_width.setSingleStep(0.1)
+        self._spin_width.setValue(2.0)
         self._spin_width.setSuffix(" px")
-        self._spin_width.setToolTip("矩形の線幅")
+        self._spin_width.setToolTip("矩形の線幅（0.1px 単位）")
         self._spin_width.valueChanged.connect(self._on_line_width_changed)
 
         # フォントサイズ
@@ -503,7 +508,7 @@ class MainWindow(QMainWindow):
             self._canvas.delete_selected()
             self._status.showMessage("オブジェクトを削除しました")
 
-    def _on_line_width_changed(self, value: int):
+    def _on_line_width_changed(self, value: float):
         self._canvas.set_line_width(value)
 
     def _on_font_size_changed(self, value: int):

@@ -46,7 +46,7 @@ class EditorCanvas(QWidget):
         # ツール設定
         self._active_tool: str | None = None
         self._color: QColor = QColor(255, 0, 0)
-        self._line_width: int = 2
+        self._line_width: float = 2.0
         self._font_size: int = 16
 
         # 描画ドラッグ用（rect / filled_rect）
@@ -107,7 +107,7 @@ class EditorCanvas(QWidget):
     def set_color(self, color: QColor) -> None:
         self._color = color
 
-    def set_line_width(self, width: int) -> None:
+    def set_line_width(self, width: float) -> None:
         self._line_width = width
 
     def set_font_size(self, size: int) -> None:
@@ -334,8 +334,8 @@ class EditorCanvas(QWidget):
         for i in range(len(self._annotations) - 1, -1, -1):
             ann = self._annotations[i]
             if isinstance(ann, (RectAnnotation, FilledRectAnnotation)):
-                # 枠線判定: 外側 + line_width分の余裕
-                margin = max(ann.line_width if isinstance(ann, RectAnnotation) else 0, 5)
+                # 枠線判定: 外側 + line_width分の余裕（QRect.adjusted は int 専用）
+                margin = int(max(ann.line_width if isinstance(ann, RectAnnotation) else 0, 5))
                 outer = ann.rect.adjusted(-margin, -margin, margin, margin)
                 if outer.contains(img_pos):
                     return i
@@ -351,6 +351,8 @@ class EditorCanvas(QWidget):
 
     def _draw_annotations(self, painter: QPainter, annotations: list[Annotation],
                           cosmetic: bool = False):
+        # 0.1px 単位の線幅を正しく表現するためアンチエイリアスを有効にする
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         for ann in annotations:
             if isinstance(ann, RectAnnotation):
                 pen = QPen(ann.color, ann.line_width)

@@ -7,7 +7,7 @@ from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGroupBox,
     QListWidget, QListWidgetItem, QPushButton, QLabel,
-    QLineEdit, QCheckBox, QSpinBox, QFileDialog,
+    QLineEdit, QCheckBox, QDoubleSpinBox, QFileDialog,
     QDialogButtonBox, QColorDialog, QMessageBox, QInputDialog,
     QSplitter, QWidget,
 )
@@ -92,8 +92,10 @@ class ProfileDialog(QDialog):
         self._btn_border_color.setFixedSize(64, 26)
         self._btn_border_color.clicked.connect(self._on_pick_border_color)
         lbl_w = QLabel("幅:")
-        self._spin_border_width = QSpinBox()
-        self._spin_border_width.setRange(1, 100)
+        self._spin_border_width = QDoubleSpinBox()
+        self._spin_border_width.setRange(0.1, 100.0)
+        self._spin_border_width.setDecimals(1)
+        self._spin_border_width.setSingleStep(0.1)
         self._spin_border_width.setSuffix(" px")
         self._spin_border_width.valueChanged.connect(self._on_effect_changed)
         detail.addWidget(QLabel("色:"))
@@ -180,7 +182,7 @@ class ProfileDialog(QDialog):
         color = QColor(prof.get("auto_border_color", "#ff0000"))
         self._btn_border_color.setIcon(_color_icon(color))
         self._btn_border_color.setProperty("color", color.name())
-        self._spin_border_width.setValue(prof.get("auto_border_width", 4))
+        self._spin_border_width.setValue(float(prof.get("auto_border_width", 4)))
         self._editing = False
         self._update_effect_enabled()
 

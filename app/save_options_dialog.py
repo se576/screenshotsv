@@ -3,7 +3,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGroupBox,
-    QCheckBox, QLabel, QSpinBox, QPushButton,
+    QCheckBox, QLabel, QDoubleSpinBox, QPushButton,
     QDialogButtonBox, QColorDialog,
 )
 
@@ -45,9 +45,11 @@ class SaveOptionsDialog(QDialog):
         self._btn_color.clicked.connect(self._pick_color)
 
         lbl_width = QLabel("幅:")
-        self._spin_width = QSpinBox()
-        self._spin_width.setRange(1, 100)
-        self._spin_width.setValue(self._config.get("auto_border_width", 4))
+        self._spin_width = QDoubleSpinBox()
+        self._spin_width.setRange(0.1, 100.0)
+        self._spin_width.setDecimals(1)
+        self._spin_width.setSingleStep(0.1)
+        self._spin_width.setValue(float(self._config.get("auto_border_width", 4)))
         self._spin_width.setSuffix(" px")
 
         detail.addWidget(lbl_color)
