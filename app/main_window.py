@@ -37,7 +37,7 @@ from app.profile_dialog import ProfileDialog
 from app.hotkey_dialog import HotkeyDialog
 from app.hotkeys import HotkeyManager
 from app.editor import EditorCanvas
-from app.ui_utils import color_icon
+from app.ui_utils import color_icon, load_icon
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +96,9 @@ class MainWindow(QMainWindow):
     def _setup_ui(self):
         self.setWindowTitle("スクリーンショット")
         self.resize(960, 680)
+        app_icon = load_icon("app-icon")
+        if not app_icon.isNull():
+            self.setWindowIcon(app_icon)
 
         # ========== キャプチャツールバー ==========
         capture_bar = QWidget()
@@ -105,12 +108,19 @@ class MainWindow(QMainWindow):
 
         # キャプチャ操作
         self._btn_full = QPushButton("全画面 [F1]")
+        self._btn_full.setIcon(load_icon("capture-full"))
         self._btn_full.setToolTip("全画面キャプチャ (F1)")
         self._btn_region = QPushButton("範囲選択 [F2]")
+        self._btn_region.setIcon(load_icon("capture-region"))
         self._btn_region.setToolTip("範囲選択キャプチャ (F2) — Esc でキャンセル")
         self._btn_window = QPushButton("ウィンドウ [F3]")
+        self._btn_window.setIcon(load_icon("capture-window"))
         self._btn_window.setToolTip("ウィンドウキャプチャ (F3) — Esc でキャンセル")
         lbl_delay = QLabel("遅延:")
+        timer_icon = load_icon("capture-timer")
+        if not timer_icon.isNull():
+            lbl_delay.setPixmap(timer_icon.pixmap(16, 16))
+            lbl_delay.setToolTip("遅延キャプチャ（キャプチャ前の待機時間）")
         self._spin_delay = QSpinBox()
         self._spin_delay.setRange(0, 30)
         self._spin_delay.setValue(0)
@@ -120,10 +130,13 @@ class MainWindow(QMainWindow):
 
         # キャプチャ後操作
         self._btn_copy = QPushButton("コピー [Ctrl+C]")
+        self._btn_copy.setIcon(load_icon("action-copy"))
         self._btn_copy.setToolTip("クリップボードにコピー (Ctrl+C)")
         self._btn_quicksave = QPushButton("即時保存 [Ctrl+Shift+S]")
+        self._btn_quicksave.setIcon(load_icon("action-save"))
         self._btn_quicksave.setToolTip("プロファイルの保存先へ即時保存 (Ctrl+Shift+S)")
         self._btn_save = QPushButton("保存... [Ctrl+S]")
+        self._btn_save.setIcon(load_icon("action-save"))
         self._btn_save.setToolTip("名前を付けて保存 (Ctrl+S)")
 
         for btn in (self._btn_copy, self._btn_quicksave, self._btn_save):
@@ -189,15 +202,18 @@ class MainWindow(QMainWindow):
         # ツール選択ボタン（トグル）
         self._btn_tool_none = QPushButton("閲覧")
         self._btn_tool_none.setToolTip("閲覧モード — スクロール・確認のみ (V)")
-        self._btn_tool_select = QPushButton("▶ 選択")
+        self._btn_tool_select = QPushButton("選択")
+        self._btn_tool_select.setIcon(load_icon("tool-arrow"))
         self._btn_tool_select.setToolTip("選択ツール — クリックで選択/ドラッグで移動 (S)")
-        self._btn_tool_rect = QPushButton("■ 矩形")
+        self._btn_tool_rect = QPushButton("矩形")
+        self._btn_tool_rect.setIcon(load_icon("tool-rect"))
         self._btn_tool_rect.setToolTip("矩形ツール — ドラッグで枠線を描画 (R)")
         self._btn_tool_filled_rect = QPushButton("█ 四角形")
         self._btn_tool_filled_rect.setToolTip("塗りつぶし四角形ツール — ドラッグで描画 (F)")
         self._btn_tool_text = QPushButton("T テキスト")
         self._btn_tool_text.setToolTip("テキストツール — ダブルクリックで文字を入力 (T)")
-        self._btn_tool_crop = QPushButton("✂ トリミング")
+        self._btn_tool_crop = QPushButton("トリミング")
+        self._btn_tool_crop.setIcon(load_icon("tool-crop"))
         self._btn_tool_crop.setToolTip("トリミングツール — ドラッグした範囲に切り抜き (C) — Ctrl+Z で元に戻せます")
         self._tool_buttons = {
             None: self._btn_tool_none,
@@ -217,15 +233,15 @@ class MainWindow(QMainWindow):
         self._btn_color.setToolTip("描画色を選択（選択中のオブジェクトがあれば色を変更）")
         self._btn_color.clicked.connect(self._on_pick_color)
 
-        # 線幅（0.1px 単位）
+        # 線幅（0.01px 単位）
         lbl_width = QLabel("線幅:")
         self._spin_width = QDoubleSpinBox()
-        self._spin_width.setRange(0.1, 20.0)
-        self._spin_width.setDecimals(1)
-        self._spin_width.setSingleStep(0.1)
+        self._spin_width.setRange(0.01, 20.0)
+        self._spin_width.setDecimals(2)
+        self._spin_width.setSingleStep(0.01)
         self._spin_width.setValue(2.0)
         self._spin_width.setSuffix(" px")
-        self._spin_width.setToolTip("矩形の線幅（0.1px 単位）")
+        self._spin_width.setToolTip("矩形の線幅（0.01px 単位）")
         self._spin_width.valueChanged.connect(self._on_line_width_changed)
 
         # フォントサイズ
@@ -238,12 +254,14 @@ class MainWindow(QMainWindow):
         self._spin_font_size.valueChanged.connect(self._on_font_size_changed)
 
         # Undo / Redo
-        self._btn_undo = QPushButton("↩ Undo [Ctrl+Z]")
+        self._btn_undo = QPushButton("Undo [Ctrl+Z]")
+        self._btn_undo.setIcon(load_icon("action-undo"))
         self._btn_undo.setToolTip("直前の操作を元に戻す (Ctrl+Z)")
         self._btn_undo.setEnabled(False)
         self._btn_undo.clicked.connect(self._on_undo)
 
-        self._btn_redo = QPushButton("↪ Redo [Ctrl+Y]")
+        self._btn_redo = QPushButton("Redo [Ctrl+Y]")
+        self._btn_redo.setIcon(load_icon("action-redo"))
         self._btn_redo.setToolTip("操作をやり直す (Ctrl+Y)")
         self._btn_redo.setEnabled(False)
         self._btn_redo.clicked.connect(self._on_redo)
@@ -518,18 +536,18 @@ class MainWindow(QMainWindow):
 
     def _update_undo_button(self, count: int):
         if count > 0:
-            self._btn_undo.setText(f"↩ Undo ({count}) [Ctrl+Z]")
+            self._btn_undo.setText(f"Undo ({count}) [Ctrl+Z]")
             self._btn_undo.setEnabled(True)
         else:
-            self._btn_undo.setText("↩ Undo [Ctrl+Z]")
+            self._btn_undo.setText("Undo [Ctrl+Z]")
             self._btn_undo.setEnabled(False)
 
     def _update_redo_button(self, count: int):
         if count > 0:
-            self._btn_redo.setText(f"↪ Redo ({count}) [Ctrl+Y]")
+            self._btn_redo.setText(f"Redo ({count}) [Ctrl+Y]")
             self._btn_redo.setEnabled(True)
         else:
-            self._btn_redo.setText("↪ Redo [Ctrl+Y]")
+            self._btn_redo.setText("Redo [Ctrl+Y]")
             self._btn_redo.setEnabled(False)
 
     def _on_undo(self):
@@ -852,7 +870,10 @@ class MainWindow(QMainWindow):
         """タスクトレイアイコンとメニューをセットアップする。"""
         if not QSystemTrayIcon.isSystemTrayAvailable():
             return
-        self._tray = QSystemTrayIcon(self._make_tray_icon(), self)
+        tray_icon = load_icon("app-icon")
+        if tray_icon.isNull():
+            tray_icon = self._make_tray_icon()  # SVG が読めない場合のフォールバック
+        self._tray = QSystemTrayIcon(tray_icon, self)
         self._tray.setToolTip("スクリーンショット")
 
         # QSystemTrayIcon は QMenu の所有権を持たないため self を親に指定して保持する

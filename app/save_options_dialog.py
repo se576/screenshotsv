@@ -46,9 +46,9 @@ class SaveOptionsDialog(QDialog):
 
         lbl_width = QLabel("幅:")
         self._spin_width = QDoubleSpinBox()
-        self._spin_width.setRange(0.1, 100.0)
-        self._spin_width.setDecimals(1)
-        self._spin_width.setSingleStep(0.1)
+        self._spin_width.setRange(0.01, 100.0)
+        self._spin_width.setDecimals(2)
+        self._spin_width.setSingleStep(0.01)
         self._spin_width.setValue(float(self._config.get("auto_border_width", 4)))
         self._spin_width.setSuffix(" px")
 

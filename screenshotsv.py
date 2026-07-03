@@ -101,11 +101,22 @@ def main():
         _activate_existing_instance()
         sys.exit(0)
 
+    # タスクバーで Python 既定ではなくアプリ独自のアイコン・グループとして扱わせる
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("screenshotsv.app")
+    except Exception:
+        pass
+
     from PySide6.QtWidgets import QApplication
     from app.main_window import MainWindow
+    from app.ui_utils import load_icon
 
     app = QApplication(sys.argv)
     app.setApplicationName("スクリーンショット")
+    # タスクバー・全ウィンドウ共通のアプリアイコン
+    app_icon = load_icon("app-icon")
+    if not app_icon.isNull():
+        app.setWindowIcon(app_icon)
     # ウィンドウを閉じてもトレイ常駐できるようにする
     app.setQuitOnLastWindowClosed(False)
     window = MainWindow()

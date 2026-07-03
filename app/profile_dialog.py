@@ -93,9 +93,9 @@ class ProfileDialog(QDialog):
         self._btn_border_color.clicked.connect(self._on_pick_border_color)
         lbl_w = QLabel("幅:")
         self._spin_border_width = QDoubleSpinBox()
-        self._spin_border_width.setRange(0.1, 100.0)
-        self._spin_border_width.setDecimals(1)
-        self._spin_border_width.setSingleStep(0.1)
+        self._spin_border_width.setRange(0.01, 100.0)
+        self._spin_border_width.setDecimals(2)
+        self._spin_border_width.setSingleStep(0.01)
         self._spin_border_width.setSuffix(" px")
         self._spin_border_width.valueChanged.connect(self._on_effect_changed)
         detail.addWidget(QLabel("色:"))
@@ -215,6 +215,8 @@ class ProfileDialog(QDialog):
         if not S.add_profile(self._root, name):
             QMessageBox.warning(self, "エラー", f"「{name}」は既に存在します。")
             return
+        # 新規作成したプロファイルへ自動で切り替える（OK 確定時にメインウィンドウへ反映）
+        S.set_active(self._root, name)
         self._refresh_list(select_name=name)
 
     def _on_rename(self):
