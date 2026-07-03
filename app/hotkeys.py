@@ -131,6 +131,24 @@ class HotkeyManager(QObject):
                 logger.warning("ホットキーリスナー起動失敗: %s", e)
                 self._listener = None
 
+    def pause(self) -> None:
+        """イベント処理を一時停止する（リスナーは生かしたままキュー処理だけ止める）。
+        モーダルダイアログ表示中のホットキー割り込みを防ぐ。"""
+        self._poll_timer.stop()
+
+    def resume(self) -> None:
+        """イベント処理を再開する。停止中に溜まったイベントは破棄する。"""
+        self._drain_queue()
+        if self._listener is not None:
+            self._poll_timer.start()
+
+    def _drain_queue(self) -> None:
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
+
     def stop(self) -> None:
         """ホットキーリスナーを停止してキューを空にする。"""
         self._poll_timer.stop()
@@ -141,11 +159,7 @@ class HotkeyManager(QObject):
                 logger.warning("ホットキーリスナー停止失敗: %s", e)
             self._listener = None
         # キューに残った未処理イベントも捨てる
-        while True:
-            try:
-                self._queue.get_nowait()
-            except queue.Empty:
-                break
+        self._drain_queue()
 
     def update(self, slots: list[dict]) -> None:
         """スロット変更時に再登録する。"""

@@ -453,7 +453,7 @@ class MainWindow(QMainWindow):
 
     def _auto_backup(self, pixmap: QPixmap):
         """無編集の元画像をバックアップフォルダへ自動保存する。"""
-        backup_dir = Path(self._config.get("save_folder", str(Path.home() / "Pictures"))) / "backup"
+        backup_dir = self._save_folder(self._config) / "backup"
         try:
             backup_dir.mkdir(parents=True, exist_ok=True)
         except OSError as e:
@@ -572,6 +572,35 @@ class MainWindow(QMainWindow):
         toast.raise_()
         QTimer.singleShot(duration_ms, toast.deleteLater)
 
+    @staticmethod
+    def _save_folder(config: dict) -> Path:
+        """設定から保存先フォルダを返す。"""
+        return Path(config.get("save_folder", str(Path.home() / "Pictures")))
+
+    def _ensure_folder(self, folder: Path, modal_error: bool) -> bool:
+        """保存先フォルダを作成する。失敗時はユーザーに通知して False を返す。"""
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            return True
+        except OSError as e:
+            logger.warning("保存フォルダの作成に失敗しました: %s: %s", folder, e)
+            if modal_error:
+                QMessageBox.critical(self, "エラー", f"保存先フォルダを作成できません:\n{folder}")
+            else:
+                # ホットキー起動などモーダルを出したくない文脈ではステータスのみ
+                self._status.showMessage(f"保存先フォルダを作成できません: {folder}")
+            return False
+
+    def _notify_saved(self, path: Path, config: dict, status_text: str | None = None):
+        """保存完了をトースト・ステータスで通知し、設定に応じてフォルダを開く。"""
+        self._show_toast(f"保存しました: {path.name}")
+        self._status.showMessage(status_text or f"保存しました: {path}")
+        if config.get("open_folder_after_save", False):
+            try:
+                os.startfile(str(path.parent))
+            except OSError as e:
+                logger.warning("フォルダを開けませんでした: %s: %s", path.parent, e)
+
     def _make_filename(self, folder: Path, ext: str = "png") -> Path:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         path = folder / f"screenshot_{ts}.{ext}"
@@ -590,22 +619,12 @@ class MainWindow(QMainWindow):
         if pixmap is None:
             return
         pixmap = self._apply_save_effects(pixmap)
-        folder = Path(self._config.get("save_folder", str(Path.home() / "Pictures")))
-        try:
-            folder.mkdir(parents=True, exist_ok=True)
-        except OSError as e:
-            logger.warning("保存フォルダの作成に失敗しました: %s: %s", folder, e)
-            QMessageBox.critical(self, "エラー", f"保存先フォルダを作成できません:\n{folder}")
+        folder = self._save_folder(self._config)
+        if not self._ensure_folder(folder, modal_error=True):
             return
         path = self._make_filename(folder, "png")
         if pixmap.save(str(path), "PNG"):
-            self._show_toast(f"保存しました: {path.name}")
-            self._status.showMessage(f"保存しました: {path}")
-            if self._config.get("open_folder_after_save", False):
-                try:
-                    os.startfile(str(folder))
-                except OSError as e:
-                    logger.warning("フォルダを開けませんでした: %s: %s", folder, e)
+            self._notify_saved(path, self._config)
         else:
             QMessageBox.critical(self, "エラー", f"保存に失敗しました:\n{path}")
 
@@ -614,12 +633,8 @@ class MainWindow(QMainWindow):
         if pixmap is None:
             return
         pixmap = self._apply_save_effects(pixmap)
-        folder = Path(self._config.get("save_folder", str(Path.home() / "Pictures")))
-        try:
-            folder.mkdir(parents=True, exist_ok=True)
-        except OSError as e:
-            logger.warning("保存フォルダの作成に失敗しました: %s: %s", folder, e)
-            QMessageBox.critical(self, "エラー", f"保存先フォルダを作成できません:\n{folder}")
+        folder = self._save_folder(self._config)
+        if not self._ensure_folder(folder, modal_error=True):
             return
         default_path = self._make_filename(folder, "png")
         path, _ = QFileDialog.getSaveFileName(
@@ -631,13 +646,7 @@ class MainWindow(QMainWindow):
         fmt = "PNG" if path.lower().endswith(".png") else "JPEG"
         if pixmap.save(path, fmt):
             self._rename_backup(Path(path))
-            self._show_toast(f"保存しました: {Path(path).name}")
-            self._status.showMessage(f"保存しました: {path}")
-            if self._config.get("open_folder_after_save", False):
-                try:
-                    os.startfile(str(Path(path).parent))
-                except OSError as e:
-                    logger.warning("フォルダを開けませんでした: %s: %s", Path(path).parent, e)
+            self._notify_saved(Path(path), self._config)
         else:
             QMessageBox.critical(self, "エラー", f"保存に失敗しました:\n{path}")
 
@@ -758,15 +767,14 @@ class MainWindow(QMainWindow):
         self._quicksave_with_profile(pixmap, prof)
 
     def _quicksave_with_profile(self, pixmap: QPixmap, prof: dict, backup: bool = True):
-        """指定プロファイルの設定で即時保存する。"""
+        """指定プロファイルの設定で即時保存する。ホットキー起動のためエラーはモーダルにしない。"""
         if pixmap is None or pixmap.isNull():
             return
-        _default_folder = str(Path.home() / "Pictures")
-        save_folder = prof.get("save_folder", _default_folder)
+        folder = self._save_folder(prof)
 
         # バックアップ
         if backup and prof.get("auto_backup_enabled", True):
-            backup_dir = Path(save_folder) / "backup"
+            backup_dir = folder / "backup"
             try:
                 backup_dir.mkdir(parents=True, exist_ok=True)
                 if not pixmap.save(str(self._make_filename(backup_dir, "png")), "PNG"):
@@ -777,22 +785,11 @@ class MainWindow(QMainWindow):
         # エフェクト適用
         result = _apply_border_effect(pixmap, prof)
 
-        folder = Path(save_folder)
-        try:
-            folder.mkdir(parents=True, exist_ok=True)
-        except OSError as e:
-            logger.warning("保存フォルダの作成に失敗しました: %s: %s", folder, e)
-            self._status.showMessage(f"保存先フォルダを作成できません: {folder}")
+        if not self._ensure_folder(folder, modal_error=False):
             return
         path = self._make_filename(folder, "png")
         if result.save(str(path), "PNG"):
-            self._show_toast(f"保存しました: {path.name}")
-            self._status.showMessage(f"保存しました [{save_folder}]: {path.name}")
-            if prof.get("open_folder_after_save", False):
-                try:
-                    os.startfile(str(folder))
-                except OSError as e:
-                    logger.warning("フォルダを開けませんでした: %s: %s", folder, e)
+            self._notify_saved(path, prof, status_text=f"保存しました [{folder}]: {path.name}")
         else:
             self._status.showMessage(f"保存に失敗しました: {path}")
 
@@ -827,8 +824,7 @@ class MainWindow(QMainWindow):
 
     def _on_choose_folder(self):
         folder = QFileDialog.getExistingDirectory(
-            self, "保存先フォルダを選択",
-            self._config.get("save_folder", str(Path.home() / "Pictures")),
+            self, "保存先フォルダを選択", str(self._save_folder(self._config)),
         )
         if folder:
             self._config["save_folder"] = folder
@@ -837,7 +833,7 @@ class MainWindow(QMainWindow):
             self._status.showMessage(f"保存先: {folder}")
 
     def _update_folder_label(self):
-        folder = self._config.get("save_folder", str(Path.home() / "Pictures"))
+        folder = self._save_folder(self._config)
         self._action_folder.setText(f"保存先: {folder}")
         self._btn_settings.setToolTip(f"保存先: {folder}")
 
@@ -1053,7 +1049,12 @@ class MainWindow(QMainWindow):
         box.setDefaultButton(btn_tray)
         remember = QCheckBox("この選択を記憶する（⚙設定メニューから変更できます）")
         box.setCheckBox(remember)
-        box.exec()
+        # ダイアログ表示中のホットキー割り込み（キャプチャがダイアログを写し込む等）を防ぐ
+        self._hotkey_manager.pause()
+        try:
+            box.exec()
+        finally:
+            self._hotkey_manager.resume()
         # 親付きで手動生成したダイアログは明示的に破棄する（親が生きている限り解放されない）
         box.deleteLater()
 
