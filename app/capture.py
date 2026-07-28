@@ -1,3 +1,5 @@
+from collections.abc import Callable
+
 from PySide6.QtCore import Qt, QRect, QPoint
 from PySide6.QtGui import QPixmap, QPainter, QColor, QPen, QCursor, QFont
 from PySide6.QtWidgets import QApplication, QWidget
@@ -31,11 +33,14 @@ class RegionSelector(QWidget):
     選択中はドラッグ範囲のサイズをリアルタイム表示する。
     """
 
-    def __init__(self, background: QPixmap, callback, cancel_callback=None):
+    def __init__(self, background: QPixmap,
+                 callback: Callable[[QPixmap], None],
+                 cancel_callback: Callable[[], None] | None = None):
         super().__init__()
         self._bg = background
         self._callback = callback
         self._cancel_callback = cancel_callback
+        self._finished = False
         self._start: QPoint | None = None
         self._end: QPoint | None = None
 
@@ -56,6 +61,12 @@ class RegionSelector(QWidget):
 
     def closeEvent(self, event):
         self.releaseKeyboard()
+        # callback もキャンセルも実行しないまま閉じた場合（Alt+F4 等）はキャンセル扱いにし、
+        # メインウィンドウが最小化・ボタン無効のままロックされるのを防ぐ
+        if not self._finished:
+            self._finished = True
+            if self._cancel_callback:
+                self._cancel_callback()
         super().closeEvent(event)
 
     def hideEvent(self, event):
@@ -102,6 +113,8 @@ class RegionSelector(QWidget):
             painter.setPen(QColor(255, 255, 255))
             painter.drawText(label_x, label_y + text_rect.height(), size_text)
 
+        painter.end()
+
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self._start = event.position().toPoint()
@@ -119,21 +132,25 @@ class RegionSelector(QWidget):
             # close() より前に pixmap を取得する（close 後は self._bg へのアクセスが不安定になるため）
             if rect.width() > 4 and rect.height() > 4:
                 pixmap = self._bg.copy(rect)
+                self._finished = True
                 self.close()
                 self._callback(pixmap)
             else:
+                self._finished = True
                 self.close()
                 if self._cancel_callback:
                     self._cancel_callback()
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape:
+            self._finished = True
             self.close()
             if self._cancel_callback:
                 self._cancel_callback()
 
 
-def start_region_capture(callback, cancel_callback=None):
+def start_region_capture(callback: Callable[[QPixmap], None],
+                         cancel_callback: Callable[[], None] | None = None) -> "RegionSelector | None":
     """
     全画面をキャプチャしてオーバーレイとして表示し、範囲選択を開始する。
     選択完了後、callbackにQPixmapを渡す。Escキャンセル時はcancel_callbackを呼ぶ。

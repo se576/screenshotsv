@@ -74,9 +74,12 @@ def _is_admin() -> bool:
 
 def _relaunch_as_admin() -> bool:
     """UACプロンプトを出して管理者権限で再起動する。成功した場合 True を返す。"""
+    # exe(frozen) では sys.executable 自体がアプリ本体のため、argv[0]（自身のパス）を
+    # 引数に重複させない。ソース実行では argv[0]=スクリプトパスを python に渡す必要がある
+    args = sys.argv[1:] if getattr(sys, "frozen", False) else sys.argv
     # ShellExecuteW は成功時に 32 より大きい値を返す
     result = ctypes.windll.shell32.ShellExecuteW(
-        None, "runas", sys.executable, subprocess.list2cmdline(sys.argv), None, 1
+        None, "runas", sys.executable, subprocess.list2cmdline(args), None, 1
     )
     return int(result) > 32
 
@@ -120,7 +123,10 @@ def main():
     # ウィンドウを閉じてもトレイ常駐できるようにする
     app.setQuitOnLastWindowClosed(False)
     window = MainWindow()
-    window.show()
+    # --tray: スタートアップ起動用。ウィンドウを表示せずトレイ常駐で開始する。
+    # トレイが使えない環境では start_in_tray() が False を返し、通常表示にフォールバックする
+    if "--tray" not in sys.argv[1:] or not window.start_in_tray():
+        window.show()
     sys.exit(app.exec())
 
 

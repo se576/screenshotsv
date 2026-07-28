@@ -4,9 +4,8 @@ __pycache__/
 .venv/
 venv/
 tasks/
-起動.bat
 dist/
 build/
-*.spec
 .claude/
 CLAUDE.md
+amadeus_v0.5_subagent_trial_spec.md

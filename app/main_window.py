@@ -36,7 +36,7 @@ from app.save_options_dialog import SaveOptionsDialog
 from app.profile_dialog import ProfileDialog
 from app.hotkey_dialog import HotkeyDialog
 from app.hotkeys import HotkeyManager
-from app.editor import EditorCanvas
+from app.editor import EditorCanvas, CanvasScrollView
 from app.ui_utils import color_icon, load_icon
 
 logger = logging.getLogger(__name__)
@@ -44,18 +44,18 @@ logger = logging.getLogger(__name__)
 
 def _apply_border_effect(pixmap: QPixmap, prof: dict) -> QPixmap:
     """プロファイル設定に基づいて外枠エフェクトを適用する。無効なら元画像を返す。"""
-    if not prof.get("auto_border_enabled", False):
+    if not prof.get("auto_border_enabled", settings.PROFILE_DEFAULTS["auto_border_enabled"]):
         return pixmap
     result = pixmap.copy()
     painter = QPainter(result)
     # 枠幅は短辺の半分でクランプする。ペンは輪郭の両側に w/2 ずつ広がるため、
     # これを超えると矩形が負寸法になる（半分ちょうどで画像全面が枠色になる）
-    w = min(float(prof.get("auto_border_width", 4)),
+    w = min(float(prof.get("auto_border_width", settings.PROFILE_DEFAULTS["auto_border_width"])),
             pixmap.width() / 2, pixmap.height() / 2)
-    color = QColor(prof.get("auto_border_color", "#ff0000"))
+    color = QColor(prof.get("auto_border_color", settings.PROFILE_DEFAULTS["auto_border_color"]))
     pen = QPen(color, w)
     pen.setJoinStyle(Qt.PenJoinStyle.MiterJoin)
-    # 0.1px 単位の幅を正しく表現する（整数丸めを防ぐ）
+    # 0.01px 単位の幅を正しく表現する（整数丸めを防ぐ）
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
     painter.setPen(pen)
     painter.setBrush(Qt.BrushStyle.NoBrush)
@@ -87,6 +87,8 @@ class MainWindow(QMainWindow):
         self._start_hotkeys()
         self._setup_tray()
         self._setup_ipc()
+        # 旧形式のスタートアップ登録（--tray なし）を起動後に自動移行する（起動を遅くしない）
+        QTimer.singleShot(1000, self._migrate_startup_task)
 
     @property
     def _config(self) -> dict:
@@ -161,6 +163,11 @@ class MainWindow(QMainWindow):
              ("quit", "終了する")),
             self._root.get("close_action", settings.DEFAULT_CLOSE_ACTION),
             self._set_close_action)
+        self._act_tray_notify = settings_menu.addAction("常駐時に通知を表示")
+        self._act_tray_notify.setCheckable(True)
+        self._act_tray_notify.setChecked(
+            self._root.get("tray_notify", settings.DEFAULT_TRAY_NOTIFY))
+        self._act_tray_notify.toggled.connect(self._set_tray_notify)
         self._btn_settings.setMenu(settings_menu)
 
         # プロファイル（右端）
@@ -266,6 +273,26 @@ class MainWindow(QMainWindow):
         self._btn_redo.setEnabled(False)
         self._btn_redo.clicked.connect(self._on_redo)
 
+        # ズーム（Ctrl+ホイールでも操作可。倍率表示クリックでフィットに戻る）
+        self._btn_zoom_out = QPushButton("−")
+        self._btn_zoom_out.setFixedWidth(28)
+        self._btn_zoom_out.setToolTip("縮小 (Ctrl+ホイール下)")
+        self._btn_zoom_out.clicked.connect(lambda: self._canvas.zoom_out())
+        self._btn_zoom_fit = QPushButton("100%")
+        self._btn_zoom_fit.setFixedWidth(56)
+        self._btn_zoom_fit.setToolTip(
+            "現在の表示倍率 — クリックでウィンドウに合わせる（フィット表示）\n"
+            "Ctrl+ホイールでカーソル位置を中心にズーム、"
+            "拡大中はスペース+ドラッグまたはスクロールバーで表示位置を移動")
+        self._btn_zoom_fit.clicked.connect(lambda: self._canvas.set_zoom(None))
+        self._btn_zoom_in = QPushButton("＋")
+        self._btn_zoom_in.setFixedWidth(28)
+        self._btn_zoom_in.setToolTip("拡大 (Ctrl+ホイール上)")
+        self._btn_zoom_in.clicked.connect(lambda: self._canvas.zoom_in())
+        self._zoom_buttons = (self._btn_zoom_out, self._btn_zoom_fit, self._btn_zoom_in)
+        for btn in self._zoom_buttons:
+            btn.setEnabled(False)
+
         def _make_sep():
             s = QFrame()
             s.setFrameShape(QFrame.Shape.VLine)
@@ -277,7 +304,8 @@ class MainWindow(QMainWindow):
                   _make_sep(), self._btn_color,
                   lbl_width, self._spin_width,
                   lbl_font, self._spin_font_size,
-                  _make_sep(), self._btn_undo, self._btn_redo):
+                  _make_sep(), self._btn_undo, self._btn_redo,
+                  _make_sep(), self._btn_zoom_out, self._btn_zoom_fit, self._btn_zoom_in):
             eb_layout.addWidget(w)
         eb_layout.addStretch()
 
@@ -290,6 +318,8 @@ class MainWindow(QMainWindow):
         self._canvas.undo_stack_changed.connect(self._update_undo_button)
         self._canvas.redo_stack_changed.connect(self._update_redo_button)
         self._canvas.crop_applied.connect(self._on_crop_applied)
+        self._canvas.zoom_changed.connect(self._update_zoom_label)
+        self._canvas_view = CanvasScrollView(self._canvas)
 
         # ========== 中央ウィジェット ==========
         central = QWidget()
@@ -298,7 +328,7 @@ class MainWindow(QMainWindow):
         layout.setSpacing(0)
         layout.addWidget(capture_bar)
         layout.addWidget(edit_bar)
-        layout.addWidget(self._canvas, stretch=1)
+        layout.addWidget(self._canvas_view, stretch=1)
         self.setCentralWidget(central)
 
         # ========== ステータスバー ==========
@@ -349,20 +379,27 @@ class MainWindow(QMainWindow):
 
     def _start_countdown(self, action):
         """遅延秒数のカウントダウンをステータスバーに表示してからactionを実行する。"""
+        # 前回のカウントダウン（0秒分岐の singleShot 含む）を確実に止めてから開始する
+        self._stop_countdown()
         secs = self._spin_delay.value()
+        self._countdown_action = action
         if secs == 0:
-            QTimer.singleShot(300, action)
+            QTimer.singleShot(300, self._fire_countdown_action)
             return
 
-        # 前回のカウントダウンが残っていれば停止
-        self._stop_countdown()
-
         self._countdown_remaining = secs
-        self._countdown_action = action
         self._countdown_timer = QTimer(self)
         self._countdown_timer.timeout.connect(self._tick_countdown)
         self._countdown_timer.start(1000)
         self._status.showMessage(f"キャプチャまで {self._countdown_remaining} 秒...")
+
+    def _fire_countdown_action(self):
+        """0秒遅延の singleShot 満了時に呼ばれる。中止済みなら何もしない。"""
+        action = self._countdown_action
+        if action is None:
+            return
+        self._countdown_action = None
+        action()
 
     def _stop_countdown(self):
         """実行中のカウントダウンタイマーを停止・破棄する。"""
@@ -374,7 +411,8 @@ class MainWindow(QMainWindow):
 
     def _cancel_countdown(self):
         """遅延キャプチャをユーザー操作として中止し、UIを操作可能な状態に戻す。"""
-        if self._countdown_timer is None:
+        # タイマー稼働中、または0秒遅延の実行待ち（_countdown_action のみ）を中止する
+        if self._countdown_timer is None and self._countdown_action is None:
             return
         self._stop_countdown()
         self._set_capture_buttons_enabled(True)
@@ -414,7 +452,6 @@ class MainWindow(QMainWindow):
 
     def _do_capture_full(self):
         pixmap = capture.capture_fullscreen()
-        self._set_capture_buttons_enabled(True)
         self._set_pixmap(pixmap)
 
     def _on_capture_region(self):
@@ -440,7 +477,6 @@ class MainWindow(QMainWindow):
             self._selector = None
 
     def _on_region_captured(self, pixmap: QPixmap):
-        self._set_capture_buttons_enabled(True)
         self._set_pixmap(pixmap)
 
     def _on_capture_cancelled(self):
@@ -460,11 +496,14 @@ class MainWindow(QMainWindow):
         # 編集画面に表示するため、トレイ格納中でもウィンドウを前面に出す（検証後のみ）
         self._show_window()
         self._canvas.set_pixmap(pixmap)
-        for btn in (self._btn_copy, self._btn_save, self._btn_quicksave):
+        for btn in (self._btn_copy, self._btn_save, self._btn_quicksave,
+                    *self._zoom_buttons):
             btn.setEnabled(True)
+        # スペース+ドラッグ等のキー操作をすぐ効かせる
+        self._canvas.setFocus()
         self._btn_undo.setEnabled(False)
         self._btn_redo.setEnabled(False)
-        if self._config.get("auto_backup_enabled", True):
+        if self._config.get("auto_backup_enabled", settings.PROFILE_DEFAULTS["auto_backup_enabled"]):
             self._auto_backup(pixmap)
         self._status.showMessage(
             f"キャプチャ完了: {pixmap.width()} x {pixmap.height()} px  |  "
@@ -496,6 +535,8 @@ class MainWindow(QMainWindow):
         for key, btn in self._tool_buttons.items():
             btn.setChecked(key == tool)
         self._canvas.set_tool(tool)
+        # ボタンにフォーカスが残るとスペース+ドラッグ（パン）がボタン押下になるため
+        self._canvas.setFocus()
         names = {None: "なし", "select": "選択", "rect": "矩形", "filled_rect": "四角形（塗りつぶし）",
                  "text": "テキスト", "crop": "トリミング"}
         if tool == "select":
@@ -507,6 +548,9 @@ class MainWindow(QMainWindow):
 
     def _on_crop_applied(self, width: int, height: int):
         self._status.showMessage(f"トリミングしました: {width} x {height} px（Ctrl+Z で元に戻せます）")
+
+    def _update_zoom_label(self, zoom: float):
+        self._btn_zoom_fit.setText(f"{round(zoom * 100)}%")
 
     def _on_pick_color(self):
         initial = (self._canvas.get_selected_color()
@@ -595,7 +639,7 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _save_folder(config: dict) -> Path:
         """設定から保存先フォルダを返す。"""
-        return Path(config.get("save_folder", str(Path.home() / "Pictures")))
+        return Path(config.get("save_folder", settings.PROFILE_DEFAULTS["save_folder"]))
 
     def _ensure_folder(self, folder: Path, modal_error: bool) -> bool:
         """保存先フォルダを作成する。失敗時はユーザーに通知して False を返す。"""
@@ -615,7 +659,7 @@ class MainWindow(QMainWindow):
         """保存完了をトースト・ステータスで通知し、設定に応じてフォルダを開く。"""
         self._show_toast(f"保存しました: {path.name}")
         self._status.showMessage(status_text or f"保存しました: {path}")
-        if config.get("open_folder_after_save", False):
+        if config.get("open_folder_after_save", settings.PROFILE_DEFAULTS["open_folder_after_save"]):
             try:
                 os.startfile(str(path.parent))
             except OSError as e:
@@ -758,9 +802,7 @@ class MainWindow(QMainWindow):
             return
 
         # 即時保存（従来動作）
-        self._capture_started_hidden = self.isHidden()
-        if not self._capture_started_hidden:
-            self.showMinimized()
+        self._begin_capture_ui()
         if action == "full":
             QTimer.singleShot(300, lambda: self._do_capture_full_with_profile(prof))
         elif action == "region":
@@ -782,10 +824,12 @@ class MainWindow(QMainWindow):
 
     def _do_capture_full_with_profile(self, prof: dict):
         pixmap = capture.capture_fullscreen()
+        self._set_capture_buttons_enabled(True)
         self._restore_window_after_capture()
         self._quicksave_with_profile(pixmap, prof)
 
     def _on_captured_with_profile(self, pixmap: QPixmap, prof: dict):
+        self._set_capture_buttons_enabled(True)
         self._restore_window_after_capture()
         self._quicksave_with_profile(pixmap, prof)
 
@@ -796,7 +840,7 @@ class MainWindow(QMainWindow):
         folder = self._save_folder(prof)
 
         # バックアップ
-        if backup and prof.get("auto_backup_enabled", True):
+        if backup and prof.get("auto_backup_enabled", settings.PROFILE_DEFAULTS["auto_backup_enabled"]):
             backup_dir = folder / "backup"
             try:
                 backup_dir.mkdir(parents=True, exist_ok=True)
@@ -831,7 +875,7 @@ class MainWindow(QMainWindow):
             self._hotkey_manager.update(self._root.get("hotkey_slots", []))
 
     def _on_profile_changed(self, name: str):
-        if name and name in self._root["profiles"]:
+        if name and name in self._root.get("profiles", {}):
             settings.set_active(self._root, name)
             self._save_settings()
             self._update_folder_label()
@@ -994,15 +1038,16 @@ class MainWindow(QMainWindow):
             self._register_startup()
         self._update_startup_action()
 
-    def _register_startup(self):
-        """ログオン時に管理者権限で起動するタスクを登録する。"""
+    def _register_startup(self, notify: bool = True):
+        """ログオン時に管理者権限で起動するタスクを登録する。
+        --tray 付きで登録し、ログオン時はウィンドウを出さずトレイ常駐で開始させる。"""
         exe_path = sys.executable
         try:
             result = subprocess.run(
                 [
                     "schtasks", "/create",
                     "/tn", self._TASK_NAME,
-                    "/tr", f'"{exe_path}"',
+                    "/tr", f'"{exe_path}" --tray',
                     "/sc", "onlogon",
                     "/rl", "highest",
                     "/f",
@@ -1010,13 +1055,37 @@ class MainWindow(QMainWindow):
                 capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW,
             )
             if result.returncode == 0:
-                self._tray.showMessage("スクリーンショット", "スタートアップに登録しました。\n次回ログオン時から自動起動します。",
-                                       QSystemTrayIcon.MessageIcon.Information, 2500)
+                if notify:
+                    self._tray.showMessage(
+                        "スクリーンショット",
+                        "スタートアップに登録しました。\n次回ログオン時からバックグラウンドで自動起動します。",
+                        QSystemTrayIcon.MessageIcon.Information, 2500)
             else:
                 raise RuntimeError(result.stderr.decode("cp932", errors="replace"))
         except Exception as e:
             logger.warning("スタートアップ登録に失敗しました: %s", e)
-            QMessageBox.warning(self, "エラー", f"スタートアップへの登録に失敗しました:\n{e}")
+            if notify:
+                QMessageBox.warning(self, "エラー", f"スタートアップへの登録に失敗しました:\n{e}")
+
+    def _migrate_startup_task(self):
+        """旧形式（--tray なし）のスタートアップ登録を検出したら新形式へ自動更新する。"""
+        if not getattr(sys, "frozen", False):
+            return
+        try:
+            result = subprocess.run(
+                ["schtasks", "/query", "/tn", self._TASK_NAME, "/xml"],
+                capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            if result.returncode != 0:
+                return  # 未登録なら何もしない
+            # 出力エンコーディングはコードページ依存のため、ASCII/UTF-16LE 両方で検索する
+            out = result.stdout
+            if b"--tray" in out or "--tray".encode("utf-16-le") in out:
+                return  # 移行済み
+            logger.info("旧形式のスタートアップ登録を検出したため --tray 付きに更新します")
+            self._register_startup(notify=False)
+        except Exception as e:
+            logger.warning("スタートアップ登録の自動更新に失敗しました: %s", e)
 
     def _unregister_startup(self):
         """スタートアップタスクを削除する。"""
@@ -1052,6 +1121,11 @@ class MainWindow(QMainWindow):
         self._save_settings()
         for v, act in self._hotkey_mode_actions.items():
             act.setChecked(v == value)
+
+    def _set_tray_notify(self, enabled: bool):
+        """トレイ常駐時の通知表示設定を保存する。"""
+        self._root["tray_notify"] = enabled
+        self._save_settings()
 
     def _set_close_action(self, value: str):
         """×ボタンの動作設定を保存し、メニューのチェック状態を同期する。"""
@@ -1097,16 +1171,29 @@ class MainWindow(QMainWindow):
             self._set_close_action(choice)
         return choice
 
+    def start_in_tray(self) -> bool:
+        """ウィンドウを表示せずトレイ常駐で開始する（--tray 起動用）。
+        トレイが使えない環境では False を返す（呼び出し元で通常表示にフォールバック）。"""
+        if self._tray is None or not self._tray.isVisible():
+            return False
+        self._notify_tray_resident()
+        return True
+
+    def _notify_tray_resident(self):
+        """設定が有効なら「バックグラウンドで動作中」のトレイ通知を表示する。"""
+        if self._tray is not None and self._root.get("tray_notify", settings.DEFAULT_TRAY_NOTIFY):
+            self._tray.showMessage(
+                "スクリーンショット",
+                "バックグラウンドで動作しています。\nホットキーは引き続き有効です。",
+                QSystemTrayIcon.MessageIcon.Information,
+                2500,
+            )
+
     def _hide_to_tray(self):
         """ウィンドウをトレイに格納する。遅延キャプチャ中なら中止する。"""
         self._cancel_countdown()
         self.hide()
-        self._tray.showMessage(
-            "スクリーンショット",
-            "バックグラウンドで動作しています。\nホットキーは引き続き有効です。",
-            QSystemTrayIcon.MessageIcon.Information,
-            2500,
-        )
+        self._notify_tray_resident()
 
     def closeEvent(self, event):
         """×ボタン: 設定に応じてトレイ常駐・終了・毎回確認を切り替える。"""

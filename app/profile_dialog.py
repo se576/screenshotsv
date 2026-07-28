@@ -19,16 +19,20 @@ from app.ui_utils import color_icon as _color_icon
 class ProfileDialog(QDialog):
     """プロファイルの一覧・作成・削除・編集を行うダイアログ。"""
 
-    def __init__(self, root: dict, parent=None):
+    def __init__(self, root: dict, parent: QWidget | None = None):
         super().__init__(parent)
         self.setWindowTitle("プロファイル管理")
         self.setMinimumSize(560, 400)
         # 編集用にディープコピー（Cancel で破棄できるように）
         self._root = copy.deepcopy(root)
+        # 構成変更（追加・削除・名前変更）の検出用スナップショット
+        self._initial_names = list(self._root.get("profiles", {}).keys())
+        # 選択中プロファイルの保存先フルパスの真値（表示ラベルの切り詰めに依存しない）
+        self._folder = ""
         self._setup_ui()
         self._refresh_list()
 
-    def _setup_ui(self):
+    def _setup_ui(self) -> None:
         layout = QHBoxLayout(self)
         layout.setSpacing(8)
 
@@ -166,23 +170,27 @@ class ProfileDialog(QDialog):
     def _truncate_path(path: str, max_len: int = 40) -> str:
         return path if len(path) <= max_len else "..." + path[-(max_len - 3):]
 
-    def _load_profile_to_ui(self, name: str):
+    def _set_folder_display(self, folder: str) -> None:
+        """保存先フルパスを真値として保持しつつ、ラベルに切り詰め表示する。"""
+        self._folder = folder
+        self._lbl_folder.setText(self._truncate_path(folder))
+        self._lbl_folder.setToolTip(folder)
+
+    def _load_profile_to_ui(self, name: str) -> None:
         if name not in self._root.get("profiles", {}):
             return
         prof = self._root["profiles"][name]
+        d = S.PROFILE_DEFAULTS
         self._editing = True
-        folder = prof.get("save_folder", "")
-        display = self._truncate_path(folder)
-        self._lbl_folder.setText(display)
-        self._lbl_folder.setToolTip(folder)
+        self._set_folder_display(prof.get("save_folder", d["save_folder"]))
 
-        self._chk_backup.setChecked(prof.get("auto_backup_enabled", True))
-        self._chk_open_folder.setChecked(prof.get("open_folder_after_save", False))
-        self._chk_border.setChecked(prof.get("auto_border_enabled", False))
-        color = QColor(prof.get("auto_border_color", "#ff0000"))
+        self._chk_backup.setChecked(prof.get("auto_backup_enabled", d["auto_backup_enabled"]))
+        self._chk_open_folder.setChecked(prof.get("open_folder_after_save", d["open_folder_after_save"]))
+        self._chk_border.setChecked(prof.get("auto_border_enabled", d["auto_border_enabled"]))
+        color = QColor(prof.get("auto_border_color", d["auto_border_color"]))
         self._btn_border_color.setIcon(_color_icon(color))
         self._btn_border_color.setProperty("color", color.name())
-        self._spin_border_width.setValue(float(prof.get("auto_border_width", 4)))
+        self._spin_border_width.setValue(float(prof.get("auto_border_width", d["auto_border_width"])))
         self._editing = False
         self._update_effect_enabled()
 
@@ -191,11 +199,12 @@ class ProfileDialog(QDialog):
         if name is None or self._editing:
             return
         prof = self._root["profiles"][name]
-        prof["save_folder"] = self._lbl_folder.toolTip() or self._lbl_folder.text()
+        prof["save_folder"] = self._folder
         prof["auto_backup_enabled"] = self._chk_backup.isChecked()
         prof["open_folder_after_save"] = self._chk_open_folder.isChecked()
         prof["auto_border_enabled"] = self._chk_border.isChecked()
-        prof["auto_border_color"] = self._btn_border_color.property("color") or "#ff0000"
+        prof["auto_border_color"] = (
+            self._btn_border_color.property("color") or S.PROFILE_DEFAULTS["auto_border_color"])
         prof["auto_border_width"] = self._spin_border_width.value()
 
     def _update_effect_enabled(self):
@@ -249,12 +258,10 @@ class ProfileDialog(QDialog):
     # ------------------------------------------------------------------
 
     def _on_browse_folder(self):
-        current = self._lbl_folder.toolTip() or str(Path.home())
+        current = self._folder or str(Path.home())
         folder = QFileDialog.getExistingDirectory(self, "保存先フォルダを選択", current)
         if folder:
-            display = self._truncate_path(folder)
-            self._lbl_folder.setText(display)
-            self._lbl_folder.setToolTip(folder)
+            self._set_folder_display(folder)
             self._save_ui_to_profile()
 
     def _on_effect_changed(self):
@@ -262,7 +269,8 @@ class ProfileDialog(QDialog):
         self._save_ui_to_profile()
 
     def _on_pick_border_color(self):
-        current = QColor(self._btn_border_color.property("color") or "#ff0000")
+        current = QColor(
+            self._btn_border_color.property("color") or S.PROFILE_DEFAULTS["auto_border_color"])
         color = QColorDialog.getColor(current, self, "外枠の色を選択")
         if color.isValid():
             self._btn_border_color.setIcon(_color_icon(color))
@@ -276,6 +284,39 @@ class ProfileDialog(QDialog):
     def accept(self):
         self._save_ui_to_profile()
         super().accept()
+
+    def reject(self):
+        """キャンセル・✕・Esc の共通経路。
+        削除・追加・名前変更は個別に確認済みのため、無言で破棄せず適用するか確認する。"""
+        if list(self._root.get("profiles", {}).keys()) != self._initial_names:
+            choice = self._ask_unapplied_changes()
+            if choice == "apply":
+                self.accept()
+                return
+            if choice == "cancel":
+                return  # ダイアログに戻る
+        super().reject()
+
+    def _ask_unapplied_changes(self) -> str:
+        """未適用の構成変更をどうするか確認する。"apply" / "discard" / "cancel" を返す。"""
+        box = QMessageBox(self)
+        box.setWindowTitle("プロファイル管理")
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText("プロファイルの追加・削除・名前変更がまだ適用されていません。")
+        box.setInformativeText("適用せずに閉じると、これらの変更は失われます。")
+        btn_apply = box.addButton("適用して閉じる", QMessageBox.ButtonRole.AcceptRole)
+        btn_discard = box.addButton("破棄して閉じる", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(btn_apply)
+        box.exec()
+        # 親付きで手動生成したダイアログは明示的に破棄する
+        box.deleteLater()
+        clicked = box.clickedButton()
+        if clicked is btn_apply:
+            return "apply"
+        if clicked is btn_discard:
+            return "discard"
+        return "cancel"
 
     def get_root(self) -> dict:
         return self._root
