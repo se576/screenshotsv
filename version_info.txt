@@ -4,8 +4,8 @@
 # メタデータのない exe はアンチウイルスのヒューリスティックスコアが悪化するため必ず埋め込む。
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 0, 0, 0),
-    prodvers=(1, 0, 0, 0),
+    filevers=(1, 0, 1, 0),
+    prodvers=(1, 0, 1, 0),
     mask=0x3F,
     flags=0x0,
     OS=0x40004,
@@ -21,12 +21,12 @@ VSVersionInfo(
           [
             StringStruct('CompanyName', 'screenshotsv'),
             StringStruct('FileDescription', 'ローカル完結型スクリーンショットツール'),
-            StringStruct('FileVersion', '1.0.0.0'),
+            StringStruct('FileVersion', '1.0.1.0'),
             StringStruct('InternalName', 'screenshotsv'),
             StringStruct('LegalCopyright', '(c) 2026 screenshotsv'),
             StringStruct('OriginalFilename', 'screenshotsv.exe'),
             StringStruct('ProductName', 'スクリーンショット'),
-            StringStruct('ProductVersion', '1.0.0.0'),
+            StringStruct('ProductVersion', '1.0.1.0'),
           ],
         )
       ]
