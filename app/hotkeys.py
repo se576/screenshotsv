@@ -57,6 +57,8 @@ class HotkeyManager(QObject):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._listener: _pynput_kb.GlobalHotKeys | None = None
+        # pause() のネスト深さ。0 に戻るまで resume() でも再開しない
+        self._pause_depth = 0
         # pynput スレッド → Qt メインスレッドへの受け渡しキュー
         self._queue: queue.SimpleQueue = queue.SimpleQueue()
         # (action, profile) → 最終発火時刻。連打によるキャプチャ・保存の多重実行を防ぐ
@@ -95,8 +97,9 @@ class HotkeyManager(QObject):
             pass
 
     def start(self, slots: list[dict]) -> None:
-        """スロットリストからホットキーを登録する。"""
+        """スロットリストからホットキーを登録する。ネスト中の pause もリセットされる。"""
         self.stop()
+        self._pause_depth = 0
         hotkey_map: dict = {}
         seen_combos: set[str] = set()
 
@@ -133,11 +136,17 @@ class HotkeyManager(QObject):
 
     def pause(self) -> None:
         """イベント処理を一時停止する（リスナーは生かしたままキュー処理だけ止める）。
-        モーダルダイアログ表示中のホットキー割り込みを防ぐ。"""
+        モーダルダイアログ表示中のホットキー割り込みを防ぐ。ネスト可。"""
+        self._pause_depth += 1
         self._poll_timer.stop()
 
     def resume(self) -> None:
-        """イベント処理を再開する。停止中に溜まったイベントは破棄する。"""
+        """イベント処理を再開する。停止中に溜まったイベントは破棄する。
+        ネストした pause がすべて解除されるまでは再開しない。"""
+        if self._pause_depth > 0:
+            self._pause_depth -= 1
+        if self._pause_depth > 0:
+            return
         self._drain_queue()
         if self._listener is not None:
             self._poll_timer.start()

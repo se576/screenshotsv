@@ -3,6 +3,7 @@ import logging
 import os
 import subprocess
 import sys
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -370,6 +371,29 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("C"), self, lambda: self._on_select_tool("crop"))
 
     # ------------------------------------------------------------------
+    # モーダルダイアログとホットキーの相互ガード
+    # ------------------------------------------------------------------
+
+    @contextmanager
+    def _hotkeys_paused(self):
+        """モーダルダイアログ表示中はグローバルホットキーの処理を止める。
+        表示中にキャプチャが始まると、全画面オーバーレイがモーダルに入力を
+        ブロックされて閉じる手段を失い、フリーズ状態に見えるため。ネスト可。"""
+        self._hotkey_manager.pause()
+        try:
+            yield
+        finally:
+            self._hotkey_manager.resume()
+
+    def _reject_capture_during_modal(self) -> bool:
+        """モーダルダイアログ表示中ならキャプチャ開始を拒否して True を返す。
+        ホットキー停止をすり抜けた経路への最終防衛線。"""
+        if QApplication.activeModalWidget() is None:
+            return False
+        self._status.showMessage("ダイアログを閉じてからキャプチャしてください")
+        return True
+
+    # ------------------------------------------------------------------
     # キャプチャ
     # ------------------------------------------------------------------
 
@@ -447,6 +471,8 @@ class MainWindow(QMainWindow):
         self.activateWindow()
 
     def _on_capture_full(self):
+        if self._reject_capture_during_modal():
+            return
         self._begin_capture_ui()
         self._start_countdown(self._do_capture_full)
 
@@ -455,10 +481,14 @@ class MainWindow(QMainWindow):
         self._set_pixmap(pixmap)
 
     def _on_capture_region(self):
+        if self._reject_capture_during_modal():
+            return
         self._begin_capture_ui()
         self._start_countdown(self._do_start_region)
 
     def _on_capture_window(self):
+        if self._reject_capture_during_modal():
+            return
         self._begin_capture_ui()
         self._start_countdown(self._do_start_window)
 
@@ -556,7 +586,8 @@ class MainWindow(QMainWindow):
         initial = (self._canvas.get_selected_color()
                    if self._active_tool == "select" and self._canvas.has_selection()
                    else self._current_color)
-        color = QColorDialog.getColor(initial, self, "色を選択")
+        with self._hotkeys_paused():
+            color = QColorDialog.getColor(initial, self, "色を選択")
         if not color.isValid():
             return
         if self._active_tool == "select" and self._canvas.has_selection():
@@ -649,7 +680,8 @@ class MainWindow(QMainWindow):
         except OSError as e:
             logger.warning("保存フォルダの作成に失敗しました: %s: %s", folder, e)
             if modal_error:
-                QMessageBox.critical(self, "エラー", f"保存先フォルダを作成できません:\n{folder}")
+                with self._hotkeys_paused():
+                    QMessageBox.critical(self, "エラー", f"保存先フォルダを作成できません:\n{folder}")
             else:
                 # ホットキー起動などモーダルを出したくない文脈ではステータスのみ
                 self._status.showMessage(f"保存先フォルダを作成できません: {folder}")
@@ -690,7 +722,8 @@ class MainWindow(QMainWindow):
         if pixmap.save(str(path), "PNG"):
             self._notify_saved(path, self._config)
         else:
-            QMessageBox.critical(self, "エラー", f"保存に失敗しました:\n{path}")
+            with self._hotkeys_paused():
+                QMessageBox.critical(self, "エラー", f"保存に失敗しました:\n{path}")
 
     def _on_save(self):
         pixmap = self._canvas.get_pixmap()
@@ -701,10 +734,11 @@ class MainWindow(QMainWindow):
         if not self._ensure_folder(folder, modal_error=True):
             return
         default_path = self._make_filename(folder, "png")
-        path, _ = QFileDialog.getSaveFileName(
-            self, "名前を付けて保存", str(default_path),
-            "PNG画像 (*.png);;JPEG画像 (*.jpg *.jpeg)",
-        )
+        with self._hotkeys_paused():
+            path, _ = QFileDialog.getSaveFileName(
+                self, "名前を付けて保存", str(default_path),
+                "PNG画像 (*.png);;JPEG画像 (*.jpg *.jpeg)",
+            )
         if not path:
             return
         fmt = "PNG" if path.lower().endswith(".png") else "JPEG"
@@ -712,7 +746,8 @@ class MainWindow(QMainWindow):
             self._rename_backup(Path(path))
             self._notify_saved(Path(path), self._config)
         else:
-            QMessageBox.critical(self, "エラー", f"保存に失敗しました:\n{path}")
+            with self._hotkeys_paused():
+                QMessageBox.critical(self, "エラー", f"保存に失敗しました:\n{path}")
 
     def _apply_save_effects(self, pixmap: QPixmap) -> QPixmap:
         """保存時自動エフェクトを適用した画像を返す。"""
@@ -727,7 +762,9 @@ class MainWindow(QMainWindow):
 
     def _on_save_options(self):
         dlg = SaveOptionsDialog(self._config, self)
-        if dlg.exec():
+        with self._hotkeys_paused():
+            accepted = dlg.exec()
+        if accepted:
             updated = dlg.get_config()
             self._config.update(updated)
             self._save_settings()
@@ -774,6 +811,8 @@ class MainWindow(QMainWindow):
     def _on_capture_with_profile(self, action: str, profile_name: str):
         """プロファイル指定ホットキーの処理。アクティブプロファイルは変わらない。
         撮影系は「ホットキー撮影後の動作」設定に従い、編集画面表示または即時保存する。"""
+        if self._reject_capture_during_modal():
+            return
         profiles = self._root.get("profiles", {})
         if profile_name not in profiles:
             return
@@ -884,7 +923,9 @@ class MainWindow(QMainWindow):
 
     def _on_profile_manage(self):
         dlg = ProfileDialog(self._root, self)
-        if dlg.exec():
+        with self._hotkeys_paused():
+            accepted = dlg.exec()
+        if accepted:
             self._root = dlg.get_root()
             self._save_settings()
             self._refresh_profile_combo()
@@ -892,9 +933,10 @@ class MainWindow(QMainWindow):
             self._status.showMessage("プロファイルを更新しました")
 
     def _on_choose_folder(self):
-        folder = QFileDialog.getExistingDirectory(
-            self, "保存先フォルダを選択", str(self._save_folder(self._config)),
-        )
+        with self._hotkeys_paused():
+            folder = QFileDialog.getExistingDirectory(
+                self, "保存先フォルダを選択", str(self._save_folder(self._config)),
+            )
         if folder:
             self._config["save_folder"] = folder
             self._save_settings()
@@ -1065,7 +1107,8 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logger.warning("スタートアップ登録に失敗しました: %s", e)
             if notify:
-                QMessageBox.warning(self, "エラー", f"スタートアップへの登録に失敗しました:\n{e}")
+                with self._hotkeys_paused():
+                    QMessageBox.warning(self, "エラー", f"スタートアップへの登録に失敗しました:\n{e}")
 
     def _migrate_startup_task(self):
         """旧形式（--tray なし）のスタートアップ登録を検出したら新形式へ自動更新する。"""
@@ -1101,7 +1144,8 @@ class MainWindow(QMainWindow):
                 raise RuntimeError(result.stderr.decode("cp932", errors="replace"))
         except Exception as e:
             logger.warning("スタートアップ削除に失敗しました: %s", e)
-            QMessageBox.warning(self, "エラー", f"スタートアップからの削除に失敗しました:\n{e}")
+            with self._hotkeys_paused():
+                QMessageBox.warning(self, "エラー", f"スタートアップからの削除に失敗しました:\n{e}")
 
     def _quit_app(self):
         """トレイメニューの「終了」または×ボタン（終了選択時）から完全に終了する。"""
@@ -1152,11 +1196,8 @@ class MainWindow(QMainWindow):
         remember = QCheckBox("この選択を記憶する（⚙設定メニューから変更できます）")
         box.setCheckBox(remember)
         # ダイアログ表示中のホットキー割り込み（キャプチャがダイアログを写し込む等）を防ぐ
-        self._hotkey_manager.pause()
-        try:
+        with self._hotkeys_paused():
             box.exec()
-        finally:
-            self._hotkey_manager.resume()
         # 親付きで手動生成したダイアログは明示的に破棄する（親が生きている限り解放されない）
         box.deleteLater()
 
